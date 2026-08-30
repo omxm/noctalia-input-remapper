@@ -6,6 +6,8 @@ right-click to stop everything.
 
 Target: Noctalia v5.0.0+ (`plugin_api = 18`) / input-remapper 2.x
 
+This is my very first project, so please go easy on me!
+
 ---
 
 ## Installation is two steps
