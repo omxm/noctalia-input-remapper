@@ -8,7 +8,9 @@ Target: Noctalia v5.0.0+ (`plugin_api = 18`) / input-remapper 2.x
 
 This is my very first project, so please go easy on me!
 
----
+## Warning!!!
+This plugin is made for runit and didn't tested on other init system (e.g. openrc, systemd)
+
 ## Example
 <img width="619" height="602" alt="screenshot_20260820_094651-region" src="https://github.com/user-attachments/assets/0c2f72d3-5180-4158-82e3-99e8561b5859" />
 
