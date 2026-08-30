@@ -1,0 +1,3 @@
+#!/bin/sh
+# /etc/runit/sv/input-remapper/log/run
+exec svlogd -tt /var/log/input-remapper

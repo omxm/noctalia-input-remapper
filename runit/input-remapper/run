@@ -1,0 +1,15 @@
+#!/bin/sh
+# /etc/runit/sv/input-remapper/run
+#
+# Keeps input-remapper-service resident as root from boot, so the GUI never has
+# to raise it through pkexec and input-remapper-control can reach it over the
+# system bus without a password prompt.
+
+# input-remapper-service claims the name "inputremapper.Control" on the system
+# bus, so dbus has to be up before it starts.
+sv check dbus >/dev/null || exit 1
+
+# Send stderr into the log service.
+exec 2>&1
+
+exec /usr/bin/input-remapper-service
