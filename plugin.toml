@@ -1,0 +1,119 @@
+id           = "haru/input-remapper"
+name         = "Input Remapper"
+version      = "0.4.0"
+plugin_api   = 18
+author       = "haru"
+license      = "MIT"
+icon         = "keyboard"
+description  = "Switch input-remapper presets straight from the bar - no password prompts, no window juggling."
+tags         = ["input", "keyboard", "mouse", "remap", "macro"]
+dependencies = ["input-remapper"]
+
+# ---------------------------------------------------------------------------
+# Plugin-level settings (Settings -> Plugins -> gear on this plugin's row).
+# Seeded into every entry: widget, panel, and service.
+# ---------------------------------------------------------------------------
+
+[[setting]]
+key             = "config_dir"
+type            = "string"
+label_key       = "settings.config_dir.label"
+description_key = "settings.config_dir.description"
+default         = "~/.config/input-remapper-2"
+
+[[setting]]
+key             = "control_cmd"
+type            = "string"
+label_key       = "settings.control_cmd.label"
+description_key = "settings.control_cmd.description"
+default         = "input-remapper-control"
+advanced        = true
+
+[[setting]]
+key             = "poll_seconds"
+type            = "int"
+label_key       = "settings.poll_seconds.label"
+description_key = "settings.poll_seconds.description"
+default         = 5
+min             = 2
+max             = 60
+
+[[setting]]
+key             = "hide_empty_devices"
+type            = "bool"
+label_key       = "settings.hide_empty_devices.label"
+description_key = "settings.hide_empty_devices.description"
+default         = true
+
+[[setting]]
+key             = "detect_connected"
+type            = "bool"
+label_key       = "settings.detect_connected.label"
+description_key = "settings.detect_connected.description"
+default         = true
+
+[[setting]]
+key             = "scroll_height"
+type            = "int"
+label_key       = "settings.scroll_height.label"
+description_key = "settings.scroll_height.description"
+default         = 0
+min             = 0
+max             = 2000
+advanced        = true
+
+[[setting]]
+key             = "debug_log"
+type            = "bool"
+label_key       = "settings.debug_log.label"
+description_key = "settings.debug_log.description"
+default         = false
+advanced        = true
+
+[[setting]]
+key             = "on_startup"
+type            = "select"
+label_key       = "settings.on_startup.label"
+description_key = "settings.on_startup.description"
+default         = "restore"
+options = [
+  { value = "restore",  label_key = "settings.on_startup.restore" },
+  { value = "clear",    label_key = "settings.on_startup.clear" },
+  { value = "stop_all", label_key = "settings.on_startup.stop_all" },
+]
+
+# ---------------------------------------------------------------------------
+# Entries
+# ---------------------------------------------------------------------------
+
+[[widget]]
+id    = "indicator"
+entry = "widget.luau"
+
+  [[widget.setting]]
+  key             = "show_label"
+  type            = "bool"
+  label_key       = "settings.show_label.label"
+  description_key = "settings.show_label.description"
+  default         = true
+
+  [[widget.setting]]
+  key             = "max_label_chars"
+  type            = "int"
+  label_key       = "settings.max_label_chars.label"
+  description_key = "settings.max_label_chars.description"
+  default         = 18
+  min             = 4
+  max             = 48
+
+[[panel]]
+id              = "panel"
+entry           = "panel.luau"
+width           = 400
+height          = 540
+placement       = "attached"
+open_near_click = true
+
+[[service]]
+id    = "service"
+entry = "service.luau"
