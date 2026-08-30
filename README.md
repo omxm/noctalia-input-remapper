@@ -12,7 +12,8 @@ This is my very first project, so please go easy on me!
 This plugin is made for runit and didn't tested on other init system (e.g. openrc, systemd)
 
 ## Example
-<img width="619" height="602" alt="screenshot_20260820_094651-region" src="https://github.com/user-attachments/assets/0c2f72d3-5180-4158-82e3-99e8561b5859" />
+![#1](assets/2.png)
+![#2](assets/1.png)
 
 ## Installation is two steps
 
