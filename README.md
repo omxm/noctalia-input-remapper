@@ -7,6 +7,7 @@ right-click to stop everything.
 Target: Noctalia v5.0.0+ (`plugin_api = 18`) / input-remapper 2.x
 
 This is my very first project, so please go easy on me!
+
 ---
 ## Example
 <img width="619" height="602" alt="screenshot_20260820_094651-region" src="https://github.com/user-attachments/assets/0c2f72d3-5180-4158-82e3-99e8561b5859" />
