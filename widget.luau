@@ -1,11 +1,15 @@
 -- haru/input-remapper : widget.luau
 --
--- Bar indicator. Left click toggles the panel, right click stops every running
--- injection at once (the "stopping is a hassle" complaint this plugin exists
--- to fix). All state comes from the service via noctalia.state.
+-- Bar indicator. Left click toggles the panel, right click stops everything
+-- that runs - input-remapper injections and ds4kbm alike (the "stopping is a
+-- hassle" complaint this plugin exists to fix). All state comes from the
+-- service via noctalia.state.
 --
--- While ds4kbm (keyboard + mouse mode) is on, the glyph turns into a gamepad
--- so it is obvious the controller is not a controller right now.
+--   nothing running            keyboard glyph, muted
+--   one preset                 keyboard glyph + preset name
+--   several                    keyboard glyph + count
+--   controller as kbd & mouse  mouse glyph + preset name
+--   daemon down                keyboard-off glyph in error color
 
 local PANEL_ID = "haru/input-remapper:panel"
 
@@ -20,6 +24,16 @@ local function controlCmd()
 		return "input-remapper-control"
 	end
 	return cmd
+end
+
+local function ds4kbmCmd(sub)
+	local dir = noctalia.pluginDir() or "."
+	return "DS4KBM_REMAPPER_CMD="
+		.. shq(controlCmd())
+		.. " "
+		.. shq(dir .. "/ds4kbm/ds4kbm-ctl")
+		.. " "
+		.. sub
 end
 
 local function truncate(text, limit)
@@ -40,6 +54,7 @@ if type(maxChars) ~= "number" then
 end
 
 local active = noctalia.state.get("active") or {}
+local running = noctalia.state.get("running") or {}
 local daemon = noctalia.state.get("daemon") or "unknown"
 local ds4kbm = noctalia.state.get("ds4kbm") or {}
 
@@ -48,19 +63,24 @@ local function render()
 	local lastPreset = nil
 	local lines = {}
 
-	for device, preset in pairs(active) do
+	-- `running` is what the daemon reports; "" means a preset this plugin did
+	-- not start, so the device name stands in for it.
+	for device, preset in pairs(running) do
 		count = count + 1
-		lastPreset = preset
-		table.insert(lines, noctalia.string.trim(device) .. "  ->  " .. preset)
+		lastPreset = (preset ~= "") and preset or noctalia.string.trim(device)
+		table.insert(lines, noctalia.string.trim(device) .. "  ->  " .. ((preset ~= "") and preset or "?"))
 	end
 	table.sort(lines)
 
+	-- ds4kbm does not need the daemon, so it keeps its own look even then.
 	local kbm = ds4kbm.state == "on"
 	if kbm then
-		table.insert(lines, 1, noctalia.string.trim(ds4kbm.device or "?") .. "  ->  " .. noctalia.tr("widget.kbm_line"))
+		count = count + 1
+		lastPreset = ds4kbm.preset or "?"
+		table.insert(lines, 1, noctalia.string.trim(ds4kbm.device or "?") .. "  ->  " .. lastPreset
+			.. "  " .. noctalia.tr("widget.kbm_suffix"))
 	end
 
-	-- ds4kbm does not need the daemon, so it still gets its own look below.
 	if daemon == "down" and not kbm then
 		barWidget.setGlyph("keyboard-off")
 		barWidget.setGlyphColor("error")
@@ -70,9 +90,9 @@ local function render()
 		return
 	end
 
-	barWidget.setGlyph(kbm and "device-gamepad-2" or "keyboard")
+	barWidget.setGlyph(kbm and "mouse" or "keyboard")
 
-	local accent = (count > 0 or kbm) and "primary" or "on_surface"
+	local accent = count > 0 and "primary" or "on_surface_variant"
 	barWidget.setGlyphColor(accent)
 	barWidget.setColor(accent)
 
@@ -81,12 +101,10 @@ local function render()
 		text = truncate(lastPreset, maxChars)
 	elseif count > 1 then
 		text = tostring(count)
-	elseif kbm and showLabel then
-		text = noctalia.tr("widget.kbm_label")
 	end
 	barWidget.setText(text)
 
-	if #lines == 0 then
+	if count == 0 then
 		barWidget.setTooltip(noctalia.tr("widget.idle"))
 	else
 		local tooltip = noctalia.tr("widget.tooltip_title") .. "\n" .. table.concat(lines, "\n")
@@ -99,6 +117,11 @@ end
 
 noctalia.state.watch("active", function(value)
 	active = (type(value) == "table") and value or {}
+	render()
+end)
+
+noctalia.state.watch("running", function(value)
+	running = (type(value) == "table") and value or {}
 	render()
 end)
 
@@ -124,10 +147,23 @@ function onClick()
 end
 
 function onRightClick()
-	local stopped = 0
+	local targets = {}
 	for device, _ in pairs(active) do
+		targets[device] = true
+	end
+	for device, _ in pairs(running) do
+		targets[device] = true
+	end
+	local stopped = 0
+	for device, _ in pairs(targets) do
 		stopped = stopped + 1
 		noctalia.runAsync(controlCmd() .. " --command stop --device " .. shq(device))
+	end
+	if ds4kbm.state == "on" then
+		stopped = stopped + 1
+		noctalia.runAsync(ds4kbmCmd("stop"), function(_result)
+			noctalia.state.set("scan_request", noctalia.nowMs())
+		end)
 	end
 
 	if stopped == 0 then
@@ -135,6 +171,7 @@ function onRightClick()
 	end
 
 	noctalia.state.set("active", {})
+	noctalia.state.set("scan_request", noctalia.nowMs())
 	noctalia.notify(noctalia.tr("panel.title"), noctalia.trp("notify.stopped_all", stopped))
 end
 

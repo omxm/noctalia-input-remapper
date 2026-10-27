@@ -1,6 +1,6 @@
 id           = "haru/input-remapper"
 name         = "Input Remapper"
-version      = "0.5.0"
+version      = "0.6.0"
 plugin_api   = 18
 author       = "haru"
 license      = "MIT"
@@ -81,6 +81,98 @@ options = [
   { value = "clear",    label_key = "settings.on_startup.clear" },
   { value = "stop_all", label_key = "settings.on_startup.stop_all" },
 ]
+
+# Keyboard & Mouse mode (ds4kbm). Passed to ds4kbm.py as command-line options;
+# a running instance is restarted when any of these change. `step` matters:
+# without it the settings slider snaps double values to whole numbers.
+
+[[setting]]
+key             = "kbm_scale"
+type            = "double"
+label_key       = "settings.kbm_scale.label"
+description_key = "settings.kbm_scale.description"
+default         = 0.9
+min             = 0.1
+max             = 1.0
+step            = 0.01
+
+[[setting]]
+key             = "kbm_deadzone"
+type            = "double"
+label_key       = "settings.kbm_deadzone.label"
+description_key = "settings.kbm_deadzone.description"
+default         = 0.08
+min             = 0.0
+max             = 0.5
+step            = 0.01
+
+[[setting]]
+key             = "kbm_cursor_y"
+type            = "double"
+label_key       = "settings.kbm_cursor_y.label"
+description_key = "settings.kbm_cursor_y.description"
+default         = 0.5
+min             = 0.0
+max             = 1.0
+step            = 0.01
+
+[[setting]]
+key             = "kbm_smoothing"
+type            = "bool"
+label_key       = "settings.kbm_smoothing.label"
+description_key = "settings.kbm_smoothing.description"
+default         = true
+
+[[setting]]
+key             = "kbm_min_cutoff"
+type            = "double"
+label_key       = "settings.kbm_min_cutoff.label"
+description_key = "settings.kbm_min_cutoff.description"
+default         = 0.5
+min             = 0.05
+max             = 10.0
+step            = 0.05
+
+[[setting]]
+key             = "kbm_beta"
+type            = "double"
+label_key       = "settings.kbm_beta.label"
+description_key = "settings.kbm_beta.description"
+default         = 1.0
+min             = 0.0
+max             = 20.0
+step            = 0.1
+
+[[setting]]
+key             = "kbm_trigger_mode"
+type            = "select"
+label_key       = "settings.kbm_trigger_mode.label"
+description_key = "settings.kbm_trigger_mode.description"
+default         = "pwm"
+options = [
+  { value = "pwm",   label_key = "settings.kbm_trigger_mode.pwm" },
+  { value = "click", label_key = "settings.kbm_trigger_mode.click" },
+]
+
+[[setting]]
+key             = "kbm_pwm_hz"
+type            = "double"
+label_key       = "settings.kbm_pwm_hz.label"
+description_key = "settings.kbm_pwm_hz.description"
+default         = 10.0
+min             = 2.0
+max             = 60.0
+step            = 1.0
+
+[[setting]]
+key             = "kbm_pwm_min_pulse"
+type            = "double"
+label_key       = "settings.kbm_pwm_min_pulse.label"
+description_key = "settings.kbm_pwm_min_pulse.description"
+default         = 0.02
+min             = 0.005
+max             = 0.2
+step            = 0.005
 
 # ---------------------------------------------------------------------------
 # Entries

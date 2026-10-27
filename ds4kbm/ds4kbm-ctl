@@ -1,68 +1,78 @@
 #!/bin/sh
-# ds4kbm-ctl start|stop|toggle|status|device
+# ds4kbm-ctl start PRESET [ds4kbm options] | stop | status | analyze DIR
 #
-#   start   release the controller from input-remapper, then run ds4kbm.py
-#   stop    stop ds4kbm.py and wait until the grab is gone
-#   toggle  start or stop
-#   status  print "on" / "off" (exit 0 / 1)
-#   device  print the controller name from the config (exit != 0 if the
-#           config is invalid or python-evdev is missing)
+#   start    release the controller from input-remapper, then run ds4kbm.py
+#            with the given input-remapper preset (presets/<device>/<name>.json).
+#            A running instance is stopped first, so this also switches presets.
+#   stop     stop ds4kbm.py and wait until the grab is gone
+#   status   print "on" and the running preset's path, or "off" (exit 0 / 1)
+#   analyze  print usable/skipped mapping counts for every preset in DIR (JSON)
 #
 # Environment:
-#   DS4KBM_CONFIG       config JSON (default: ~/.config/ds4kbm/config.json)
 #   DS4KBM_REMAPPER_CMD input-remapper control command (default: input-remapper-control)
 DIR=$(dirname "$(readlink -f "$0")")
-RUN=${XDG_RUNTIME_DIR:-/tmp}/ds4kbm
+# must match run_prefix() in ds4kbm.py
+if [ -n "$XDG_RUNTIME_DIR" ]; then RUN=$XDG_RUNTIME_DIR/ds4kbm; else RUN=/tmp/ds4kbm-$(id -u); fi
 PIDFILE=$RUN.pid
 LOG=$RUN.log
 REMAPPER=${DS4KBM_REMAPPER_CMD:-input-remapper-control}
 
-# serialize concurrent invocations (rapid toggle clicks)
+# serialize concurrent invocations (rapid clicks)
 exec 9>"$RUN.lock"
 flock 9
 
+# ds4kbm.py holds an exclusive lock on its pidfile for as long as it runs and
+# writes its own pid (line 1) and preset (line 2) there, so "locked" is the
+# ground truth for "running".
 running() {
-    [ -f "$PIDFILE" ] || return 1
-    pid=$(cat "$PIDFILE")
-    # guard against a stale pidfile whose pid got reused
-    kill -0 "$pid" 2>/dev/null && grep -q ds4kbm.py "/proc/$pid/cmdline" 2>/dev/null
-}
-
-device() {
-    python3 "$DIR/ds4kbm.py" --check
+    [ -f "$PIDFILE" ] && ! flock -n "$PIDFILE" true 2>/dev/null
 }
 
 start() {
-    running && return 0
-    name=$(device) || exit 1
+    preset=$1
+    shift
+    [ -f "$preset" ] || { echo "no such preset: $preset" >&2; exit 1; }
+    stop
+    device=$(basename "$(dirname "$(readlink -f "$preset")")")
     # input-remapper must let go of the controller or the grab fails
     # (ds4kbm.py keeps retrying, so a slow release is harmless)
-    $REMAPPER --command stop --device "$name" >/dev/null 2>&1
-    setsid python3 -u "$DIR/ds4kbm.py" >"$LOG" 2>&1 </dev/null 9>&- &
-    echo $! >"$PIDFILE"
-    sleep 0.3
+    $REMAPPER --command stop --device "$device" >/dev/null 2>&1
+    setsid python3 -u "$DIR/ds4kbm.py" "$preset" "$@" >"$LOG" 2>&1 </dev/null 9>&- &
+    child=$!
+    i=0
+    while ! running && kill -0 "$child" 2>/dev/null && [ $i -lt 30 ]; do sleep 0.1; i=$((i + 1)); done
     if ! running; then
-        rm -f "$PIDFILE"
         cat "$LOG" >&2
         exit 1
     fi
 }
 
 stop() {
-    if running; then
-        kill "$pid"
-        i=0
-        while kill -0 "$pid" 2>/dev/null && [ $i -lt 30 ]; do sleep 0.1; i=$((i + 1)); done
-        kill -0 "$pid" 2>/dev/null && kill -9 "$pid"
-    fi
-    rm -f "$PIDFILE"
+    running || return 0
+    pid=$(head -n 1 "$PIDFILE")
+    kill "$pid" 2>/dev/null
+    i=0
+    while running && [ $i -lt 30 ]; do sleep 0.1; i=$((i + 1)); done
+    running && kill -9 "$pid" 2>/dev/null
+    while running; do sleep 0.1; done
 }
 
 case "$1" in
-    start) start ;;
+    start)
+        [ -n "$2" ] || { echo "usage: $0 start PRESET [options]" >&2; exit 2; }
+        shift
+        start "$@"
+        ;;
     stop) stop ;;
-    toggle) if running; then stop; else start; fi ;;
-    status) if running; then echo on; else echo off; exit 1; fi ;;
-    device) device ;;
-    *) echo "usage: $0 start|stop|toggle|status|device" >&2; exit 2 ;;
+    status)
+        if running; then
+            echo on
+            sed -n 2p "$PIDFILE"
+        else
+            echo off
+            exit 1
+        fi
+        ;;
+    analyze) python3 "$DIR/ds4kbm.py" --analyze "$2" ;;
+    *) echo "usage: $0 start PRESET [options] | stop | status | analyze DIR" >&2; exit 2 ;;
 esac
