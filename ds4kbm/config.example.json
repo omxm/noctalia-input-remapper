@@ -1,0 +1,33 @@
+{
+  "_comment": "Copy to ~/.config/ds4kbm/config.json and edit. Codes are evdev names (see README).",
+  "device_name": "Wireless Controller",
+  "steer": {
+    "axis": "ABS_X",
+    "scale": 0.9,
+    "deadzone": 0.08,
+    "expo": 1.0
+  },
+  "cursor_y": 0.5,
+  "triggers": {
+    "mode": "pwm",
+    "map": {
+      "ABS_RZ": "BTN_LEFT",
+      "ABS_Z": "BTN_RIGHT"
+    },
+    "deadzone": 8,
+    "click_on": 40,
+    "click_off": 20,
+    "pwm_hz": 10,
+    "pwm_min_pulse": 0.02,
+    "pwm_full": 0.95
+  },
+  "buttons": {
+    "BTN_SOUTH": "KEY_SPACE",
+    "BTN_EAST": "KEY_E",
+    "BTN_NORTH": "KEY_Q",
+    "BTN_WEST": "KEY_F",
+    "BTN_TL": "KEY_LEFTSHIFT",
+    "BTN_TR": "KEY_LEFTCTRL",
+    "BTN_START": "KEY_ESC"
+  }
+}

@@ -3,6 +3,9 @@
 -- Bar indicator. Left click toggles the panel, right click stops every running
 -- injection at once (the "stopping is a hassle" complaint this plugin exists
 -- to fix). All state comes from the service via noctalia.state.
+--
+-- While ds4kbm (keyboard + mouse mode) is on, the glyph turns into a gamepad
+-- so it is obvious the controller is not a controller right now.
 
 local PANEL_ID = "haru/input-remapper:panel"
 
@@ -38,6 +41,7 @@ end
 
 local active = noctalia.state.get("active") or {}
 local daemon = noctalia.state.get("daemon") or "unknown"
+local ds4kbm = noctalia.state.get("ds4kbm") or {}
 
 local function render()
 	local count = 0
@@ -49,8 +53,15 @@ local function render()
 		lastPreset = preset
 		table.insert(lines, noctalia.string.trim(device) .. "  ->  " .. preset)
 	end
+	table.sort(lines)
 
-	if daemon == "down" then
+	local kbm = ds4kbm.state == "on"
+	if kbm then
+		table.insert(lines, 1, noctalia.string.trim(ds4kbm.device or "?") .. "  ->  " .. noctalia.tr("widget.kbm_line"))
+	end
+
+	-- ds4kbm does not need the daemon, so it still gets its own look below.
+	if daemon == "down" and not kbm then
 		barWidget.setGlyph("keyboard-off")
 		barWidget.setGlyphColor("error")
 		barWidget.setColor("error")
@@ -59,9 +70,9 @@ local function render()
 		return
 	end
 
-	barWidget.setGlyph("keyboard")
+	barWidget.setGlyph(kbm and "device-gamepad-2" or "keyboard")
 
-	local accent = count > 0 and "primary" or "on_surface"
+	local accent = (count > 0 or kbm) and "primary" or "on_surface"
 	barWidget.setGlyphColor(accent)
 	barWidget.setColor(accent)
 
@@ -70,14 +81,19 @@ local function render()
 		text = truncate(lastPreset, maxChars)
 	elseif count > 1 then
 		text = tostring(count)
+	elseif kbm and showLabel then
+		text = noctalia.tr("widget.kbm_label")
 	end
 	barWidget.setText(text)
 
-	if count == 0 then
+	if #lines == 0 then
 		barWidget.setTooltip(noctalia.tr("widget.idle"))
 	else
-		table.sort(lines)
-		barWidget.setTooltip(noctalia.tr("widget.tooltip_title") .. "\n" .. table.concat(lines, "\n"))
+		local tooltip = noctalia.tr("widget.tooltip_title") .. "\n" .. table.concat(lines, "\n")
+		if daemon == "down" then
+			tooltip = tooltip .. "\n" .. noctalia.tr("widget.daemon_down")
+		end
+		barWidget.setTooltip(tooltip)
 	end
 end
 
@@ -88,6 +104,11 @@ end)
 
 noctalia.state.watch("daemon", function(value)
 	daemon = value or "unknown"
+	render()
+end)
+
+noctalia.state.watch("ds4kbm", function(value)
+	ds4kbm = (type(value) == "table") and value or {}
 	render()
 end)
 

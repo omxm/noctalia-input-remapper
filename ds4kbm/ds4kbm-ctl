@@ -1,0 +1,68 @@
+#!/bin/sh
+# ds4kbm-ctl start|stop|toggle|status|device
+#
+#   start   release the controller from input-remapper, then run ds4kbm.py
+#   stop    stop ds4kbm.py and wait until the grab is gone
+#   toggle  start or stop
+#   status  print "on" / "off" (exit 0 / 1)
+#   device  print the controller name from the config (exit != 0 if the
+#           config is invalid or python-evdev is missing)
+#
+# Environment:
+#   DS4KBM_CONFIG       config JSON (default: ~/.config/ds4kbm/config.json)
+#   DS4KBM_REMAPPER_CMD input-remapper control command (default: input-remapper-control)
+DIR=$(dirname "$(readlink -f "$0")")
+RUN=${XDG_RUNTIME_DIR:-/tmp}/ds4kbm
+PIDFILE=$RUN.pid
+LOG=$RUN.log
+REMAPPER=${DS4KBM_REMAPPER_CMD:-input-remapper-control}
+
+# serialize concurrent invocations (rapid toggle clicks)
+exec 9>"$RUN.lock"
+flock 9
+
+running() {
+    [ -f "$PIDFILE" ] || return 1
+    pid=$(cat "$PIDFILE")
+    # guard against a stale pidfile whose pid got reused
+    kill -0 "$pid" 2>/dev/null && grep -q ds4kbm.py "/proc/$pid/cmdline" 2>/dev/null
+}
+
+device() {
+    python3 "$DIR/ds4kbm.py" --check
+}
+
+start() {
+    running && return 0
+    name=$(device) || exit 1
+    # input-remapper must let go of the controller or the grab fails
+    # (ds4kbm.py keeps retrying, so a slow release is harmless)
+    $REMAPPER --command stop --device "$name" >/dev/null 2>&1
+    setsid python3 -u "$DIR/ds4kbm.py" >"$LOG" 2>&1 </dev/null 9>&- &
+    echo $! >"$PIDFILE"
+    sleep 0.3
+    if ! running; then
+        rm -f "$PIDFILE"
+        cat "$LOG" >&2
+        exit 1
+    fi
+}
+
+stop() {
+    if running; then
+        kill "$pid"
+        i=0
+        while kill -0 "$pid" 2>/dev/null && [ $i -lt 30 ]; do sleep 0.1; i=$((i + 1)); done
+        kill -0 "$pid" 2>/dev/null && kill -9 "$pid"
+    fi
+    rm -f "$PIDFILE"
+}
+
+case "$1" in
+    start) start ;;
+    stop) stop ;;
+    toggle) if running; then stop; else start; fi ;;
+    status) if running; then echo on; else echo off; exit 1; fi ;;
+    device) device ;;
+    *) echo "usage: $0 start|stop|toggle|status|device" >&2; exit 2 ;;
+esac

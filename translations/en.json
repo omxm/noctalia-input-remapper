@@ -47,5 +47,15 @@
   "notify.stopped_all.other": "Stopped {count} injections.",
   "widget.idle": "Input Remapper\nNothing is being remapped.",
   "widget.daemon_down": "Input Remapper\nThe input-remapper daemon is not reachable.",
-  "widget.tooltip_title": "Input Remapper"
+  "widget.tooltip_title": "Input Remapper",
+  "panel.kbm_mode": "Keyboard + Mouse mode",
+  "panel.kbm_on": "On",
+  "panel.kbm_off": "Off",
+  "panel.kbm_locked": "Presets are paused while keyboard + mouse mode is on. Start turns it off first.",
+  "panel.kbm_disconnected": "Connect the controller first.",
+  "notify.kbm_start_failed": "Could not start keyboard + mouse mode",
+  "notify.kbm_stop_failed": "Could not stop keyboard + mouse mode",
+  "notify.kbm_generic_body": "ds4kbm-ctl returned an error. Check $XDG_RUNTIME_DIR/ds4kbm.log.",
+  "widget.kbm_line": "keyboard + mouse mode",
+  "widget.kbm_label": "KB+M"
 }

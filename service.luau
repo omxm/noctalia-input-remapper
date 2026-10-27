@@ -5,15 +5,17 @@
 --   devices : array of { name, display, presets = { "a", "b", ... } }
 --   active  : map  device name -> preset name currently injecting
 --   daemon  : "ok" | "down"
+--   ds4kbm  : { state = "on" | "off", device = name | nil, error = text | nil }
 --
 -- The panel writes back to `active` after it runs a start/stop command; this
--- service persists that map so it survives a Noctalia restart.
+-- service persists that map so it survives a Noctalia restart. `ds4kbm` is
+-- only ever written here; the panel bumps `scan_request` after toggling it.
 
 -- ---------------------------------------------------------------------------
 -- instrumentation (0.3.1 diagnostic build)
 -- ---------------------------------------------------------------------------
 
-local PLUGIN_VERSION = "0.4.0"
+local PLUGIN_VERSION = "0.5.0"
 
 local VM_ID = string.format("%04x", (noctalia.nowMs() % 65536))
 	.. string.format("%02x", math.random(0, 255))
@@ -83,6 +85,18 @@ end
 
 local function stopCmd(device)
 	return controlCmd() .. " --command stop --device " .. shq(device)
+end
+
+-- ds4kbm/ds4kbm-ctl, with input-remapper's control command handed down so a
+-- wrapper configured in the plugin settings is honored there too.
+local function ds4kbmCmd(sub)
+	local dir = noctalia.pluginDir() or "."
+	return "DS4KBM_REMAPPER_CMD="
+		.. shq(controlCmd())
+		.. " "
+		.. shq(dir .. "/ds4kbm/ds4kbm-ctl")
+		.. " "
+		.. sub
 end
 
 local function presetsRoot()
@@ -281,6 +295,74 @@ local function checkDaemon()
 	end)
 end
 
+-- ---------------------------------------------------------------------------
+-- ds4kbm (keyboard + mouse mode)
+-- ---------------------------------------------------------------------------
+
+local ds4kbmDevice = nil
+local ds4kbmError = nil
+local ds4kbmRunning = false
+
+local function publishDs4kbm()
+	local value = {
+		state = ds4kbmRunning and "on" or "off",
+		device = ds4kbmDevice,
+		error = ds4kbmError,
+	}
+	-- Compare against what is actually in state rather than a private cache,
+	-- so the published value can never get stuck behind a stale copy.
+	if noctalia.json.encode(value) ~= noctalia.json.encode(noctalia.state.get("ds4kbm")) then
+		dbg("ds4kbm -> " .. value.state .. " device=" .. tostring(ds4kbmDevice))
+		noctalia.state.set("ds4kbm", value)
+	end
+end
+
+-- The controller name comes from the ds4kbm config; this also tells us
+-- whether ds4kbm can run at all (python-evdev installed, config valid).
+local function resolveDs4kbmDevice()
+	noctalia.runAsync(ds4kbmCmd("device"), function(result)
+		if result ~= nil and result.exitCode == 0 then
+			local name = noctalia.string.trim(result.stdout or "")
+			ds4kbmDevice = (name ~= "") and name or nil
+			ds4kbmError = nil
+		else
+			ds4kbmDevice = nil
+			ds4kbmError = (result ~= nil) and noctalia.string.trim(result.stderr or "") or ""
+			if ds4kbmError == "" then
+				ds4kbmError = "ds4kbm-ctl failed"
+			end
+		end
+		publishDs4kbm()
+	end)
+end
+
+local function checkDs4kbm()
+	noctalia.runAsync(ds4kbmCmd("status"), function(result)
+		ds4kbmRunning = (result ~= nil and result.exitCode == 0)
+
+		-- ds4kbm releases the controller from input-remapper when it starts,
+		-- so a remembered preset for that device is no longer injecting.
+		if ds4kbmRunning and ds4kbmDevice ~= nil then
+			local current = noctalia.state.get("active")
+			if type(current) == "table" then
+				for device, _ in pairs(current) do
+					if trim(device) == trim(ds4kbmDevice) then
+						local copy = {}
+						for k, v in pairs(current) do
+							copy[k] = v
+						end
+						copy[device] = nil
+						noctalia.state.set("active", copy)
+						break
+					end
+				end
+			end
+		end
+
+		publishDs4kbm()
+	end)
+end
+
 local function stopAll()
 	local current = noctalia.state.get("active")
 	if type(current) ~= "table" then
@@ -321,6 +403,8 @@ dbg("data dir:     " .. tostring(noctalia.pluginDataDir()))
 noctalia.state.set("active", startupActive)
 publishDevices()
 checkDaemon()
+resolveDs4kbmDevice()
+checkDs4kbm()
 
 -- ---------------------------------------------------------------------------
 -- watches
@@ -337,6 +421,8 @@ noctalia.state.watch("scan_request", function(_value)
 	lastDevicesJson = nil
 	publishDevices()
 	checkDaemon()
+	resolveDs4kbmDevice()
+	checkDs4kbm()
 end)
 
 noctalia.state.watch("stop_all_request", function(_value)
@@ -356,6 +442,7 @@ function update()
 
 	publishDevices()
 	checkDaemon()
+	checkDs4kbm()
 end
 
 function onConfigChanged()
@@ -363,6 +450,8 @@ function onConfigChanged()
 	lastDaemonOk = nil
 	publishDevices()
 	checkDaemon()
+	resolveDs4kbmDevice()
+	checkDs4kbm()
 end
 
 -- noctalia msg plugin haru/input-remapper:service all reload
@@ -372,6 +461,8 @@ function onIpc(event, _payload)
 		lastDevicesJson = nil
 		publishDevices()
 		checkDaemon()
+		resolveDs4kbmDevice()
+		checkDs4kbm()
 	elseif event == "stop-all" then
 		stopAll()
 	end

@@ -87,6 +87,7 @@ different generations at the same time.
 | Start / Stop on a device row | Start with the last-picked (or first) preset / stop |
 | Reload | Rescan presets and re-check the daemon |
 | Stop all | Stop every running injection |
+| Keyboard + Mouse mode On / Off | Turn [ds4kbm](#keyboard--mouse-mode-ds4kbm) on or off for that controller |
 
 The `setted` badge means that preset is **currently injecting**.
 
@@ -97,6 +98,114 @@ noctalia msg panel-toggle haru/input-remapper:panel
 noctalia msg plugin haru/input-remapper:service all reload
 noctalia msg plugin haru/input-remapper:service all stop-all
 ```
+
+---
+
+## Keyboard + Mouse mode (ds4kbm)
+
+`ds4kbm/` turns a DualShock 4 into a **keyboard + mouse**. Applications never
+see a gamepad while it runs: the real controller (plus its touchpad and
+motion-sensor nodes) is grabbed exclusively, and only a virtual keyboard and a
+virtual absolute pointer are exposed.
+
+This is meant for games that switch their controls or UI based on the *last
+input device*. A DS4 stick drifts a few units around center all the time, so
+the game keeps flipping between gamepad and mouse mode and the UI flickers.
+With ds4kbm the game only ever sees keyboard and mouse input.
+
+| Controller | Output |
+|---|---|
+| Left stick X | Cursor X, absolute. Snaps back to the screen center when released |
+| R2 / L2 | Left / right mouse button. In `pwm` mode the button is pulsed with a duty cycle that follows the trigger depth, so a half-pulled trigger acts like a half-pressed pedal |
+| Buttons | Keys, as configured |
+
+Events are only emitted when the output actually changes, and the stick has a
+deadzone, so an idle controller produces no input at all.
+
+### Requirements
+
+- `python` 3 and [`python-evdev`](https://python-evdev.readthedocs.io/)
+  (Arch/Artix: `sudo pacman -S python-evdev`)
+- `util-linux` (`flock`, `setsid`)
+- Read access to `/dev/input/event*` and write access to `/dev/uinput`. The
+  usual way is membership in the `input` group:
+
+  ```sh
+  sudo usermod -aG input "$USER"   # then log out and back in
+  ls -l /dev/uinput                # must be writable by you
+  ```
+
+  If `/dev/uinput` is `root:root 600` on your system, add a udev rule:
+
+  ```sh
+  echo 'KERNEL=="uinput", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"' \
+    | sudo tee /etc/udev/rules.d/99-uinput.rules
+  sudo udevadm control --reload && sudo udevadm trigger
+  ```
+
+No root is needed at runtime and no service has to be installed.
+
+### Configuration
+
+```sh
+mkdir -p ~/.config/ds4kbm
+cp ds4kbm/config.example.json ~/.config/ds4kbm/config.json
+```
+
+Without a user config, `ds4kbm/config.example.json` is used as-is.
+`DS4KBM_CONFIG=/path/to/file.json` overrides the location.
+
+| Key | Default | Description |
+|---|---|---|
+| `device_name` | `Wireless Controller` | evdev name of the controller. Also decides which device card in the panel gets the toggle |
+| `steer.axis` | `ABS_X` | Stick axis that drives the cursor |
+| `steer.scale` | `0.9` | Full deflection moves the cursor this fraction of the way from center to the screen edge |
+| `steer.deadzone` | `0.08` | Fraction of the stick range ignored around center |
+| `steer.expo` | `1.0` | Response curve. `1.0` is linear, higher values give finer control near center |
+| `cursor_y` | `0.5` | Fixed vertical cursor position (`0` top, `1` bottom) |
+| `triggers.mode` | `pwm` | `pwm` (analog-ish pulses) or `click` (plain press/release) |
+| `triggers.map` | `ABS_RZ`→`BTN_LEFT`, `ABS_Z`→`BTN_RIGHT` | Trigger axis → mouse button |
+| `triggers.deadzone` | `8` | Trigger values below this (0-255) count as released |
+| `triggers.click_on` / `click_off` | `40` / `20` | Press / release thresholds for `click` mode |
+| `triggers.pwm_hz` | `10` | Pulses per second in `pwm` mode |
+| `triggers.pwm_min_pulse` | `0.02` | Shortest pulse in seconds. Shorter clicks can fall between game frames |
+| `triggers.pwm_full` | `0.95` | Above this trigger depth (0-1) the button is held solid |
+| `buttons` | see example | Controller button → key, e.g. `"BTN_SOUTH": "KEY_SPACE"`. `BTN_LEFT` / `BTN_RIGHT` / `BTN_MIDDLE` are allowed as targets too |
+
+Codes are evdev names. Run `evtest` on the controller to see which button
+sends what (on a DS4 with `hid-playstation`: Cross `BTN_SOUTH`, Circle
+`BTN_EAST`, Triangle `BTN_NORTH`, Square `BTN_WEST`, L1/R1 `BTN_TL`/`BTN_TR`,
+L3/R3 `BTN_THUMBL`/`BTN_THUMBR`, Share `BTN_SELECT`, Options `BTN_START`, PS
+`BTN_MODE`). Check a config with `ds4kbm/ds4kbm.py --check`.
+
+The screen size does not need to be configured: the pointer is absolute, so
+the compositor maps it to the output. On a multi-monitor layout it spans the
+whole layout.
+
+### Running it
+
+From the panel, use the **Keyboard + Mouse mode** row on the controller's
+device card. It can also be used without the plugin:
+
+```sh
+ds4kbm/ds4kbm-ctl start    # release the controller from input-remapper, then grab it
+ds4kbm/ds4kbm-ctl stop
+ds4kbm/ds4kbm-ctl toggle
+ds4kbm/ds4kbm-ctl status   # prints on/off, exit code 0/1
+```
+
+Concurrent calls are serialized with `flock`, so rapid toggling never starts
+two instances. `stop` waits until the process is gone and the grab is
+released. The log is at `$XDG_RUNTIME_DIR/ds4kbm.log`.
+
+ds4kbm and an input-remapper preset never run on the same controller at the
+same time: `start` stops input-remapper's injection for that device first,
+and starting a preset from the panel stops ds4kbm first. While ds4kbm is on,
+that card's preset rows are locked and the bar widget shows a gamepad glyph
+with a `KB+M` label.
+
+If ds4kbm loses the controller (Bluetooth drop), it keeps running and grabs
+it again when it reconnects.
 
 ---
 
@@ -175,8 +284,10 @@ alongside the plugin and the two fall out of sync, Reload fixes it.
 
 **Communication between entries**
 `service` is the single source of truth: it publishes `devices` / `active` /
-`daemon` to `noctalia.state`, and `panel` / `widget` watch them. `panel`
-writes back to `active` after a command succeeds.
+`daemon` / `ds4kbm` to `noctalia.state`, and `panel` / `widget` watch them.
+`panel` writes back to `active` after a command succeeds. `ds4kbm` is only
+written by `service`, which polls `ds4kbm-ctl status`; after toggling it, the
+panel bumps `scan_request` so the service re-checks right away.
 
 ---
 
@@ -196,6 +307,13 @@ writes back to `active` after a command succeeds.
 - **No autoload support**: `config.json`'s `autoload` is empty by default, so
   there's no UI for it yet. Could be added later as an "applies on startup"
   badge.
+- **The ds4kbm toggle needs a matching preset folder**: it is attached to the
+  device card whose name matches `device_name`, so the controller needs at
+  least one input-remapper preset (or turn off `hide_empty_devices` and create
+  an empty folder for it). `ds4kbm-ctl` works regardless.
+- **ds4kbm is DS4-oriented**: the default layout follows `hid-playstation`.
+  Other controllers may work by changing `device_name` and the codes, but
+  have not been tested.
 - **Injection state is self-reported, not measured**: the daemon's D-Bus
   interface exposes `get_state`, which could replace the current
   self-tracking approach and eliminate drift when the GUI is used at the same

@@ -9,7 +9,7 @@
 -- and prints its version + VM id in the panel, so the drifting-layout problem
 -- can be diagnosed from evidence instead of guesswork.
 
-local PLUGIN_VERSION = "0.4.0"
+local PLUGIN_VERSION = "0.5.0"
 
 -- ---------------------------------------------------------------------------
 -- instrumentation
@@ -88,6 +88,17 @@ end
 
 local function stopCmd(device)
 	return controlCmd() .. " --command stop --device " .. shq(device)
+end
+
+-- ds4kbm/ds4kbm-ctl, see service.luau for why the control command is passed.
+local function ds4kbmCmd(sub)
+	local dir = noctalia.pluginDir() or "."
+	return "DS4KBM_REMAPPER_CMD="
+		.. shq(controlCmd())
+		.. " "
+		.. shq(dir .. "/ds4kbm/ds4kbm-ctl")
+		.. " "
+		.. sub
 end
 
 local function copyMap(source)
@@ -177,9 +188,11 @@ local isOpen = false
 local devices = noctalia.state.get("devices") or {}
 local active = copyMap(noctalia.state.get("active"))
 local daemon = noctalia.state.get("daemon") or "unknown"
+local ds4kbm = noctalia.state.get("ds4kbm") or {}
 
 local selected = {}
 local busy = {}
+local kbmBusy = false
 local sectionOpen = { connected = true, saved = false }
 
 local renderCount = 0
@@ -196,17 +209,20 @@ local function publishActive()
 	noctalia.state.set("active", active)
 end
 
+-- Is this the device ds4kbm is configured for?
+local function isKbmDevice(device)
+	return ds4kbm.device ~= nil and noctalia.string.trim(device) == noctalia.string.trim(ds4kbm.device)
+end
+
+local function kbmOn(device)
+	return ds4kbm.state == "on" and isKbmDevice(device)
+end
+
 -- ---------------------------------------------------------------------------
 -- actions
 -- ---------------------------------------------------------------------------
 
-local function startPreset(device, preset)
-	if busy[device] then
-		return
-	end
-	busy[device] = true
-	render()
-
+local function runStart(device, preset)
 	noctalia.runAsync(startCmd(device, preset), function(result)
 		busy[device] = nil
 		if result ~= nil and result.exitCode == 0 then
@@ -225,6 +241,56 @@ local function startPreset(device, preset)
 				errorText(result, "notify.generic_body")
 			)
 		end
+		render()
+	end)
+end
+
+local function startPreset(device, preset)
+	if busy[device] then
+		return
+	end
+	busy[device] = true
+	render()
+
+	-- Never run both at once: ds4kbm holds an exclusive grab on the
+	-- controller, so it has to let go before input-remapper can inject.
+	if kbmOn(device) then
+		noctalia.runAsync(ds4kbmCmd("stop"), function(_result)
+			dbg("ds4kbm stopped before starting " .. device .. " -> " .. preset)
+			requestScan()
+			runStart(device, preset)
+		end)
+	else
+		runStart(device, preset)
+	end
+end
+
+local function toggleKbm(device)
+	if kbmBusy then
+		return
+	end
+	local turningOn = ds4kbm.state ~= "on"
+	kbmBusy = true
+	render()
+
+	noctalia.runAsync(ds4kbmCmd(turningOn and "start" or "stop"), function(result)
+		kbmBusy = false
+		if result ~= nil and result.exitCode == 0 then
+			dbg("ds4kbm " .. (turningOn and "started" or "stopped"))
+			-- ds4kbm-ctl start already released the device from input-remapper.
+			if turningOn and active[device] ~= nil then
+				active[device] = nil
+				publishActive()
+			end
+		else
+			dbg("DS4KBM " .. (turningOn and "START" or "STOP") .. " FAILED")
+			noctalia.notifyError(
+				noctalia.tr(turningOn and "notify.kbm_start_failed" or "notify.kbm_stop_failed"),
+				errorText(result, "notify.kbm_generic_body")
+			)
+		end
+		-- The service owns `ds4kbm`; ask it to re-check right away.
+		requestScan()
 		render()
 	end)
 end
@@ -254,6 +320,9 @@ local function stopDevice(device)
 end
 
 local function onPresetClicked(device, preset)
+	if kbmOn(device) then
+		return
+	end
 	if active[device] == preset then
 		stopDevice(device)
 	else
@@ -432,7 +501,7 @@ local function sectionHeader(sectionKey, titleKey, count)
 	})
 end
 
-local function presetRow(deviceEntry, preset)
+local function presetRow(deviceEntry, preset, locked)
 	local device = deviceEntry.name
 	local isActive = active[device] == preset
 
@@ -470,15 +539,61 @@ local function presetRow(deviceEntry, preset)
 		paddingV = 5,
 		radius = 8,
 		fill = isActive and "primary/0.16" or nil,
-		onClick = function()
+		-- Locked while keyboard + mouse mode owns the controller.
+		opacity = locked and 0.4 or nil,
+		onClick = (not locked) and function()
 			onPresetClicked(device, preset)
-		end,
+		end or nil,
+	}, children)
+end
+
+local function kbmRow(deviceEntry, dimmed)
+	local device = deviceEntry.name
+	local on = kbmOn(device)
+
+	local children = {
+		ui.glyph({
+			name = "device-gamepad-2",
+			size = 13,
+			color = on and "primary" or "on_surface_variant",
+		}),
+		ui.label({
+			text = noctalia.tr("panel.kbm_mode"),
+			fontSize = 12,
+			color = on and "primary" or "on_surface",
+			flexGrow = 1,
+			maxLines = 1,
+		}),
+		ui.button({
+			text = kbmBusy and noctalia.tr("panel.working")
+				or (on and noctalia.tr("panel.kbm_on") or noctalia.tr("panel.kbm_off")),
+			fontSize = 11,
+			variant = on and "primary" or "ghost",
+			controlSize = "sm",
+			-- A controller that is not plugged in has nothing to grab.
+			enabled = not kbmBusy and not dimmed,
+			tooltip = dimmed and noctalia.tr("panel.kbm_disconnected") or nil,
+			onClick = function()
+				toggleKbm(device)
+			end,
+		}),
+	}
+
+	return ui.row({
+		key = "kbm:" .. device,
+		gap = 8,
+		align = "center",
+		paddingH = 7,
+		paddingV = 4,
+		radius = 8,
+		fill = on and "primary/0.16" or nil,
 	}, children)
 end
 
 local function deviceCard(deviceEntry, dimmed)
 	local device = deviceEntry.name
-	local isActive = active[device] ~= nil
+	local locked = kbmOn(device)
+	local isActive = active[device] ~= nil or locked
 	local isBusy = busy[device] == true
 
 	local rows = {
@@ -493,9 +608,9 @@ local function deviceCard(deviceEntry, dimmed)
 			}),
 			ui.button({
 				text = isBusy and noctalia.tr("panel.working")
-					or (isActive and noctalia.tr("panel.stop") or noctalia.tr("panel.start")),
+					or (active[device] ~= nil and noctalia.tr("panel.stop") or noctalia.tr("panel.start")),
 				fontSize = 11,
-				variant = isActive and "destructive" or "primary",
+				variant = active[device] ~= nil and "destructive" or "primary",
 				controlSize = "sm",
 				enabled = not isBusy and #deviceEntry.presets > 0,
 				onClick = function()
@@ -504,6 +619,20 @@ local function deviceCard(deviceEntry, dimmed)
 			}),
 		}),
 	}
+
+	if isKbmDevice(device) then
+		table.insert(rows, kbmRow(deviceEntry, dimmed))
+		if locked then
+			table.insert(rows, ui.row({ paddingH = 7, paddingV = 2 }, {
+				ui.label({
+					text = noctalia.tr("panel.kbm_locked"),
+					fontSize = 10,
+					color = "on_surface_variant",
+					maxLines = 2,
+				}),
+			}))
+		end
+	end
 
 	if #deviceEntry.presets == 0 then
 		table.insert(rows, ui.row({ paddingH = 7, paddingV = 4 }, {
@@ -515,7 +644,7 @@ local function deviceCard(deviceEntry, dimmed)
 		}))
 	else
 		for _, preset in ipairs(deviceEntry.presets) do
-			table.insert(rows, presetRow(deviceEntry, preset))
+			table.insert(rows, presetRow(deviceEntry, preset, locked))
 		end
 	end
 
@@ -648,6 +777,8 @@ render = function(force)
 		devices = devices,
 		active = active,
 		daemon = daemon,
+		ds4kbm = ds4kbm,
+		kbmBusy = kbmBusy,
 		busy = busy,
 		sections = sectionOpen,
 		selected = selected,
@@ -720,6 +851,11 @@ noctalia.state.watch("daemon", function(value)
 	render()
 end)
 
+noctalia.state.watch("ds4kbm", function(value)
+	ds4kbm = (type(value) == "table") and value or {}
+	render()
+end)
+
 -- ---------------------------------------------------------------------------
 -- lifecycle
 -- ---------------------------------------------------------------------------
@@ -744,6 +880,7 @@ function onOpen(_context)
 	devices = noctalia.state.get("devices") or devices
 	active = copyMap(noctalia.state.get("active"))
 	daemon = noctalia.state.get("daemon") or daemon
+	ds4kbm = noctalia.state.get("ds4kbm") or ds4kbm
 
 	-- Root cause of the 0.2.x/0.3.0/0.3.1 "flip-flopping look": sectionOpen
 	-- used to persist across close/open. Whatever it was last toggled to (by

@@ -47,5 +47,15 @@
   "notify.stopped_all.other": "注入を {count} 件停止しました。",
   "widget.idle": "Input Remapper\n現在リマップは動作していません。",
   "widget.daemon_down": "Input Remapper\ninput-remapper デーモンに接続できません。",
-  "widget.tooltip_title": "Input Remapper"
+  "widget.tooltip_title": "Input Remapper",
+  "panel.kbm_mode": "Keyboard + Mouse モード",
+  "panel.kbm_on": "ON",
+  "panel.kbm_off": "OFF",
+  "panel.kbm_locked": "Keyboard + Mouse モード中はプリセットを使えません。開始を押すと先にモードを停止します。",
+  "panel.kbm_disconnected": "先にコントローラーを接続してください。",
+  "notify.kbm_start_failed": "Keyboard + Mouse モードを開始できませんでした",
+  "notify.kbm_stop_failed": "Keyboard + Mouse モードを停止できませんでした",
+  "notify.kbm_generic_body": "ds4kbm-ctl がエラーを返しました。$XDG_RUNTIME_DIR/ds4kbm.log を確認してください。",
+  "widget.kbm_line": "Keyboard + Mouse モード",
+  "widget.kbm_label": "KB+M"
 }
