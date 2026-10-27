@@ -81,15 +81,27 @@ different generations at the same time.
 | Action | Effect |
 |---|---|
 | Left-click the widget | Toggle the panel |
-| Right-click the widget | Stop every running injection |
+| Right-click the widget | Stop everything that runs (input-remapper injections and keyboard & mouse mode) |
 | Middle-click the widget | Widget settings (standard Noctalia behavior) |
-| Click a preset row | Switch to it. Click again while active to stop it |
-| Start / Stop on a device row | Start with the last-picked (or first) preset / stop |
-| Reload | Rescan presets and re-check the daemon |
-| Stop all | Stop every running injection |
-| Keyboard + Mouse mode On / Off | Turn [ds4kbm](#keyboard--mouse-mode-ds4kbm) on or off for that controller |
+| Click a preset row | Start it. Click the running row again to stop it |
+| Stop on a running device card | Stop whatever runs on that device |
+| Games see it as: Controller / Keyboard & Mouse | Gamepads only. How the controller's presets are run, see [Keyboard & Mouse mode](#keyboard--mouse-mode) |
+| Tune | Open the plugin settings (keyboard & mouse tuning lives there) |
+| Reload (header) | Rescan presets and re-check the daemon |
+| Stop all (footer) | Stop everything that runs |
 
-The `setted` badge means that preset is **currently injecting**.
+A running card shows `Running · <preset>` under its name, and the running row
+is marked `ACTIVE`.
+
+Bar widget:
+
+| Looks like | Means |
+|---|---|
+| Keyboard glyph, muted | Nothing is running |
+| Keyboard glyph + preset name | One preset runs |
+| Keyboard glyph + number | Several presets run |
+| Mouse glyph + preset name | A controller runs a preset as keyboard & mouse |
+| Crossed-out keyboard in the error color | The input-remapper daemon is not reachable |
 
 Also reachable over IPC:
 
@@ -101,38 +113,67 @@ noctalia msg plugin haru/input-remapper:service all stop-all
 
 ---
 
-## Keyboard + Mouse mode (ds4kbm)
+## Keyboard & Mouse mode
 
-`ds4kbm/` turns a DualShock 4 into a **keyboard + mouse**. Applications never
-see a gamepad while it runs: the real controller (plus its touchpad and
-motion-sensor nodes) is grabbed exclusively, and only a virtual keyboard and a
-virtual absolute pointer are exposed.
+Every gamepad card has a **Games see it as** switch:
+
+- **Controller** - input-remapper runs the preset as usual.
+- **Keyboard & Mouse** - the bundled `ds4kbm` runs the *same* preset instead,
+  and games never see a gamepad. The real controller (plus its touchpad and
+  motion-sensor nodes) is grabbed exclusively, and only a virtual keyboard and
+  a virtual absolute pointer are exposed.
 
 This is meant for games that switch their controls or UI based on the *last
 input device*. A DS4 stick drifts a few units around center all the time, so
-the game keeps flipping between gamepad and mouse mode and the UI flickers.
-With ds4kbm the game only ever sees keyboard and mouse input.
+such a game keeps flipping between gamepad and mouse mode and the UI flickers.
+In keyboard & mouse mode the game only ever sees keyboard and mouse input.
 
-| Controller | Output |
+The choice is remembered per device. Switching while a preset runs moves that
+preset over to the other mode.
+
+| Controller | Output in keyboard & mouse mode |
 |---|---|
-| Left stick X | Cursor X, absolute. Snaps back to the screen center when released |
-| R2 / L2 | Left / right mouse button. In `pwm` mode the button is pulsed with a duty cycle that follows the trigger depth, so a half-pulled trigger acts like a half-pressed pedal |
-| Buttons | Keys, as configured |
+| Left stick X | Cursor X, absolute. Snaps back to the screen center when released, smoothed against stick jitter |
+| R2 / L2 | Left / right mouse button. By default the button is pulsed with a duty cycle that follows the trigger depth, so a half-pulled trigger acts like a half-pressed pedal |
+| Everything else | Whatever the preset maps it to |
 
 Events are only emitted when the output actually changes, and the stick has a
 deadzone, so an idle controller produces no input at all.
+
+### Which mappings work
+
+ds4kbm reads the preset JSON itself (it does not use input-remapper's code),
+and supports what a keyboard & mouse can express:
+
+| Mapping | Supported |
+|---|---|
+| Button → key (`KEY_V`) | Yes |
+| Button → mouse button (`BTN_LEFT`, `BTN_RIGHT`, `BTN_MIDDLE`, `BTN_SIDE`, `BTN_EXTRA`) | Yes. May share a button with R2 / L2; it stays pressed while either holds it |
+| Button → `hold_keys(KEY_LEFTSHIFT, KEY_E)` | Yes. Pressed in order, released in reverse |
+| D-pad / axis past a threshold → key | Yes |
+| Anything with gamepad output | No - showing a gamepad is what this mode avoids |
+| Left stick X, R2, L2 as inputs | No - used for the cursor and clicks |
+| Other macros, combinations, analog axis mappings | No |
+
+Unsupported mappings are skipped: the panel shows `N mappings skipped` under
+the preset, and ds4kbm logs each one to `$XDG_RUNTIME_DIR/ds4kbm.log`. A
+preset with no usable mapping at all is greyed out in keyboard & mouse mode.
+
+Mappings are set up in the input-remapper GUI as usual. To adapt a preset for
+this mode without changing the original, copy it in the GUI and edit the copy
+(for example map R1 to `BTN_RIGHT` with the `mouse` target as a second brake).
 
 ### Requirements
 
 - `python` 3 and [`python-evdev`](https://python-evdev.readthedocs.io/)
   (Arch/Artix: `sudo pacman -S python-evdev`)
 - `util-linux` (`flock`, `setsid`)
-- Read access to `/dev/input/event*` and write access to `/dev/uinput`. The
-  usual way is membership in the `input` group:
+- Read access to `/dev/input/event*` and write access to `/dev/uinput` as
+  your normal user. The usual way is membership in the `input` group:
 
   ```sh
   sudo usermod -aG input "$USER"   # then log out and back in
-  ls -l /dev/uinput                # must be writable by you
+  ls -l /dev/input/event* /dev/uinput   # both must be accessible to you
   ```
 
   If `/dev/uinput` is `root:root 600` on your system, add a udev rule:
@@ -143,66 +184,34 @@ deadzone, so an idle controller produces no input at all.
   sudo udevadm control --reload && sudo udevadm trigger
   ```
 
-No root is needed at runtime and no service has to be installed.
+No root is needed at runtime and no service has to be installed. The screen
+size does not need to be configured: the pointer is absolute, so the
+compositor maps it to the output (on a multi-monitor layout it spans the whole
+layout).
 
-### Configuration
+### Tuning
 
-```sh
-mkdir -p ~/.config/ds4kbm
-cp ds4kbm/config.example.json ~/.config/ds4kbm/config.json
-```
+Cursor and trigger behavior are plugin settings (the **Tune** button opens
+them, see [Settings](#settings)). Changing one restarts a running ds4kbm with
+the new values.
 
-Without a user config, `ds4kbm/config.example.json` is used as-is.
-`DS4KBM_CONFIG=/path/to/file.json` overrides the location.
-
-| Key | Default | Description |
-|---|---|---|
-| `device_name` | `Wireless Controller` | evdev name of the controller. Also decides which device card in the panel gets the toggle |
-| `steer.axis` | `ABS_X` | Stick axis that drives the cursor |
-| `steer.scale` | `0.9` | Full deflection moves the cursor this fraction of the way from center to the screen edge |
-| `steer.deadzone` | `0.08` | Fraction of the stick range ignored around center |
-| `steer.expo` | `1.0` | Response curve. `1.0` is linear, higher values give finer control near center |
-| `cursor_y` | `0.5` | Fixed vertical cursor position (`0` top, `1` bottom) |
-| `triggers.mode` | `pwm` | `pwm` (analog-ish pulses) or `click` (plain press/release) |
-| `triggers.map` | `ABS_RZ`→`BTN_LEFT`, `ABS_Z`→`BTN_RIGHT` | Trigger axis → mouse button |
-| `triggers.deadzone` | `8` | Trigger values below this (0-255) count as released |
-| `triggers.click_on` / `click_off` | `40` / `20` | Press / release thresholds for `click` mode |
-| `triggers.pwm_hz` | `10` | Pulses per second in `pwm` mode |
-| `triggers.pwm_min_pulse` | `0.02` | Shortest pulse in seconds. Shorter clicks can fall between game frames |
-| `triggers.pwm_full` | `0.95` | Above this trigger depth (0-1) the button is held solid |
-| `buttons` | see example | Controller button → key, e.g. `"BTN_SOUTH": "KEY_SPACE"`. `BTN_LEFT` / `BTN_RIGHT` / `BTN_MIDDLE` are allowed as targets too |
-
-Codes are evdev names. Run `evtest` on the controller to see which button
-sends what (on a DS4 with `hid-playstation`: Cross `BTN_SOUTH`, Circle
-`BTN_EAST`, Triangle `BTN_NORTH`, Square `BTN_WEST`, L1/R1 `BTN_TL`/`BTN_TR`,
-L3/R3 `BTN_THUMBL`/`BTN_THUMBR`, Share `BTN_SELECT`, Options `BTN_START`, PS
-`BTN_MODE`). Check a config with `ds4kbm/ds4kbm.py --check`.
-
-The screen size does not need to be configured: the pointer is absolute, so
-the compositor maps it to the output. On a multi-monitor layout it spans the
-whole layout.
-
-### Running it
-
-From the panel, use the **Keyboard + Mouse mode** row on the controller's
-device card. It can also be used without the plugin:
+### Without the panel
 
 ```sh
-ds4kbm/ds4kbm-ctl start    # release the controller from input-remapper, then grab it
+ds4kbm/ds4kbm-ctl start "$HOME/.config/input-remapper-2/presets/Wireless Controller/My preset.json"
 ds4kbm/ds4kbm-ctl stop
-ds4kbm/ds4kbm-ctl toggle
-ds4kbm/ds4kbm-ctl status   # prints on/off, exit code 0/1
+ds4kbm/ds4kbm-ctl status          # "on" + preset path, or "off" (exit code 0 / 1)
+ds4kbm/ds4kbm-ctl analyze DIR     # usable / skipped mapping counts per preset, as JSON
+ds4kbm/ds4kbm.py --help           # tuning options accepted after the preset in "start"
 ```
 
-Concurrent calls are serialized with `flock`, so rapid toggling never starts
-two instances. `stop` waits until the process is gone and the grab is
-released. The log is at `$XDG_RUNTIME_DIR/ds4kbm.log`.
-
-ds4kbm and an input-remapper preset never run on the same controller at the
-same time: `start` stops input-remapper's injection for that device first,
-and starting a preset from the panel stops ds4kbm first. While ds4kbm is on,
-that card's preset rows are locked and the bar widget shows a gamepad glyph
-with a `KB+M` label.
+`start` releases the device from input-remapper first and replaces a running
+instance, so it also switches presets. Concurrent calls are serialized with
+`flock`, and `ds4kbm.py` itself holds an exclusive lock on its pidfile while
+it runs, so a second instance refuses to start no matter how it was launched.
+`ds4kbm-ctl` uses that lock as the source of truth, so it also finds and stops
+an instance started by hand. `stop` waits until the process is gone and the
+grab is released.
 
 If ds4kbm loses the controller (Bluetooth drop), it keeps running and grabs
 it again when it reconnects.
@@ -223,6 +232,15 @@ Settings → Plugins → the gear icon on this plugin's row.
 | `scroll_height` | `0` | List height. `0` = automatic; set a number only if the footer gets pushed off |
 | `debug_log` | `false` | Write diagnostics to `<pluginDataDir>/debug.log`. Only needed while troubleshooting |
 | `on_startup` | `restore` | What to do with the remembered injection state when Noctalia starts |
+| `kbm_scale` | `0.9` | Keyboard & mouse: full stick deflection moves the cursor this fraction of the way from the screen center to the edge |
+| `kbm_deadzone` | `0.08` | Keyboard & mouse: fraction of the stick range ignored around center |
+| `kbm_cursor_y` | `0.5` | Keyboard & mouse: fixed vertical cursor position, `0` = top of the screen, `1` = bottom. Move it off the game's on-screen buttons |
+| `kbm_smoothing` | `true` | Keyboard & mouse: smooth the cursor with a [One Euro filter](https://gery.casiez.net/1euro/). DS4 sticks wobble a few units even when held still, which is tens of pixels of jitter |
+| `kbm_min_cutoff` | `0.5` | Keyboard & mouse: filter cutoff (Hz) while the stick is still. Lower = less jitter, more lag on slow movements |
+| `kbm_beta` | `1.0` | Keyboard & mouse: how quickly smoothing backs off as the stick moves faster. Higher = less lag on quick flicks, more jitter |
+| `kbm_trigger_mode` | `pwm` | Keyboard & mouse: `pwm` (pulsed by trigger depth) or `click` (plain press / release) |
+| `kbm_pwm_hz` | `10` | Keyboard & mouse: pulses per second in `pwm` mode |
+| `kbm_pwm_min_pulse` | `0.02` | Keyboard & mouse: shortest pulse in seconds. Shorter clicks can fall between game frames |
 
 Widget settings (bar widget config):
 
@@ -276,18 +294,51 @@ AJAZZ receivers report seven leading spaces), so every interpolated value goes
 through POSIX single-quote escaping (`'` -> `'\''`).
 
 **State tracking**
-input-remapper has no CLI to report which preset is currently injecting, so
-the plugin remembers the start/stop commands it issued and persists that to
-`pluginDataDir()`. If the daemon becomes unreachable, injection is impossible
-by definition, so the remembered state is dropped. If the GUI is used
-alongside the plugin and the two fall out of sync, Reload fixes it.
+Whether a device is injecting comes from the daemon itself: every refresh,
+the service calls the daemon's `get_state` over D-Bus with `dbus-send` (part
+of dbus, so no extra dependency), one shell call for all devices. Starting
+and stopping from the input-remapper GUI therefore shows up in the panel too.
+
+The daemon reports *that* a device injects, not *which* preset, so the plugin
+also remembers the preset it asked for (persisted in `pluginDataDir()`). A
+run the plugin did not start is shown as `Running` without a preset name. A
+remembered preset is forgotten once the device has been plugged in for two
+refreshes in a row and the daemon still says it is not injecting (stopped
+from the GUI, or failed). If the daemon becomes unreachable, injection is
+impossible by definition, so the remembered state is dropped.
+
+The daemon keeps reporting `RUNNING` for a device that was unplugged, so a
+device only counts as running while it is actually connected.
+
+**Re-applying after a reconnect**
+input-remapper does not re-apply a preset when a device reconnects (a
+Bluetooth controller that drops, a hub that resets). The service notices a
+device that was gone at the previous refresh and is back now, and starts its
+remembered preset again. Detection reads `/proc/bus/input/devices` and leaves
+out the copies input-remapper and ds4kbm create (they carry the real device's
+name), so a controller never looks connected just because its copy exists.
+Keyboard & mouse mode needs no help: ds4kbm keeps running when the controller
+disappears and grabs it again when it returns.
+
+**Gamepad detection**
+A device counts as a gamepad when the kernel gives it a `js` handler in
+`/proc/bus/input/devices`. Gamepads seen once are remembered in
+`pluginDataDir()`, so a disconnected controller keeps its mode switch.
 
 **Communication between entries**
 `service` is the single source of truth: it publishes `devices` / `active` /
-`daemon` / `ds4kbm` to `noctalia.state`, and `panel` / `widget` watch them.
-`panel` writes back to `active` after a command succeeds. `ds4kbm` is only
-written by `service`, which polls `ds4kbm-ctl status`; after toggling it, the
-panel bumps `scan_request` so the service re-checks right away.
+`running` / `daemon` / `modes` / `ds4kbm` / `kbm_analysis` to
+`noctalia.state`, and `panel` / `widget` watch them. `panel` writes back to
+`active` (the preset it asked for) and `modes`, which the service persists.
+`running` (from D-Bus) and `ds4kbm` (from `ds4kbm-ctl status`) are only
+written by `service`; after every start or stop the panel bumps
+`scan_request` so the service re-checks right away. `kbm_analysis` comes from
+`ds4kbm-ctl analyze`, run whenever the preset list changes.
+
+**Props that toggle**
+The panel never passes `nil` for a prop that changes between renders (`fill`,
+`opacity`, `onClick`): an omitted prop keeps its previous value on the
+retained node, so "off" is always spelled out explicitly.
 
 ---
 
@@ -307,17 +358,16 @@ panel bumps `scan_request` so the service re-checks right away.
 - **No autoload support**: `config.json`'s `autoload` is empty by default, so
   there's no UI for it yet. Could be added later as an "applies on startup"
   badge.
-- **The ds4kbm toggle needs a matching preset folder**: it is attached to the
-  device card whose name matches `device_name`, so the controller needs at
-  least one input-remapper preset (or turn off `hide_empty_devices` and create
-  an empty folder for it). `ds4kbm-ctl` works regardless.
-- **ds4kbm is DS4-oriented**: the default layout follows `hid-playstation`.
-  Other controllers may work by changing `device_name` and the codes, but
-  have not been tested.
-- **Injection state is self-reported, not measured**: the daemon's D-Bus
-  interface exposes `get_state`, which could replace the current
-  self-tracking approach and eliminate drift when the GUI is used at the same
-  time.
+- **Keyboard & mouse mode is DS4-oriented**: the cursor axis and triggers
+  follow `hid-playstation` (`ABS_X`, `ABS_RZ`, `ABS_Z`). Other gamepads get the
+  mode switch too but have not been tested.
+- **One controller at a time in keyboard & mouse mode**: ds4kbm runs as a
+  single instance; starting it for a second gamepad replaces the first.
+- **The preset name of a GUI-started run is unknown**: the daemon does not
+  say which preset it injects, so such a run shows as `Running` only.
+- **Re-applying needs connection detection**: with `detect_connected` off
+  the service still watches `/proc/bus/input/devices` for reconnects, but if
+  that file cannot be read, nothing is re-applied.
 
 ## License
 

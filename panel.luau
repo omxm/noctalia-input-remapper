@@ -1,15 +1,21 @@
 -- haru/input-remapper : panel.luau
 --
--- The pop-up surface. Reads devices/active/daemon from noctalia.state (the
--- service publishes them), runs input-remapper-control on click, and writes
--- the new active map back to state so the widget and the service follow along.
+-- The pop-up surface. Reads devices/active/running/daemon/modes/ds4kbm/
+-- kbm_analysis from noctalia.state (the service publishes them), runs
+-- input-remapper-control or ds4kbm-ctl on click, and writes `active` (what we
+-- asked for) / `modes` back to state so the widget and the service follow
+-- along. What is shown as running comes from `running`, which the service
+-- reads from the daemon over D-Bus.
 --
--- 0.3.1 is an INSTRUMENTED build. It writes a debug log to
---   <pluginDataDir>/debug.log
--- and prints its version + VM id in the panel, so the drifting-layout problem
--- can be diagnosed from evidence instead of guesswork.
+-- Gamepads can run a preset in one of two ways ("games see it as"):
+--   controller        input-remapper injects the preset as usual
+--   keyboard & mouse  ds4kbm grabs the controller and runs the same preset,
+--                     exposing only a keyboard and a pointer to games
+--
+-- With debug_log on it writes <pluginDataDir>/debug.log and prints its
+-- version + VM id in the footer.
 
-local PLUGIN_VERSION = "0.5.0"
+local PLUGIN_VERSION = "0.6.0"
 
 -- ---------------------------------------------------------------------------
 -- instrumentation
@@ -90,6 +96,14 @@ local function stopCmd(device)
 	return controlCmd() .. " --command stop --device " .. shq(device)
 end
 
+local function presetsRoot()
+	local dir = noctalia.getConfig("config_dir")
+	if dir == nil or dir == "" then
+		dir = "~/.config/input-remapper-2"
+	end
+	return noctalia.expandPath(dir) .. "/presets"
+end
+
 -- ds4kbm/ds4kbm-ctl, see service.luau for why the control command is passed.
 local function ds4kbmCmd(sub)
 	local dir = noctalia.pluginDir() or "."
@@ -99,6 +113,31 @@ local function ds4kbmCmd(sub)
 		.. shq(dir .. "/ds4kbm/ds4kbm-ctl")
 		.. " "
 		.. sub
+end
+
+-- Tuning from the plugin settings, as ds4kbm.py options. Kept identical to
+-- the copy in service.luau.
+local function ds4kbmArgs()
+	local function num(key, fallback)
+		local value = noctalia.getConfig(key)
+		if type(value) ~= "number" then
+			value = fallback
+		end
+		return string.format("%g", value)
+	end
+	local mode = noctalia.getConfig("kbm_trigger_mode")
+	if mode ~= "click" then
+		mode = "pwm"
+	end
+	return " --scale " .. num("kbm_scale", 0.9)
+		.. " --deadzone " .. num("kbm_deadzone", 0.08)
+		.. " --cursor-y " .. num("kbm_cursor_y", 0.5)
+		.. (noctalia.getConfig("kbm_smoothing") == false and " --no-smoothing" or " --smoothing")
+		.. " --min-cutoff " .. num("kbm_min_cutoff", 0.5)
+		.. " --beta " .. num("kbm_beta", 1.0)
+		.. " --trigger-mode " .. mode
+		.. " --pwm-hz " .. num("kbm_pwm_hz", 10)
+		.. " --pwm-min-pulse " .. num("kbm_pwm_min_pulse", 0.02)
 end
 
 local function copyMap(source)
@@ -177,7 +216,12 @@ local PANEL_HEIGHT = manifestPanelHeight() or FALLBACK_PANEL_HEIGHT
 local ROOT_HEIGHT = PANEL_HEIGHT - (ROOT_PADDING * 2)
 
 local CARD_FILL = "surface_variant/0.45"
+-- The reconciler keeps a prop's old value when it is omitted, so props that
+-- toggle get an explicit "off" value instead of nil.
+local NO_FILL = "surface_variant/0"
+local function noop() end
 local CARD_RADIUS = 12
+local ROW_RADIUS = 8
 local SCROLL_MIN_HEIGHT = 80
 
 -- ---------------------------------------------------------------------------
@@ -187,12 +231,14 @@ local SCROLL_MIN_HEIGHT = 80
 local isOpen = false
 local devices = noctalia.state.get("devices") or {}
 local active = copyMap(noctalia.state.get("active"))
+local running = copyMap(noctalia.state.get("running"))
 local daemon = noctalia.state.get("daemon") or "unknown"
+local modes = copyMap(noctalia.state.get("modes"))
 local ds4kbm = noctalia.state.get("ds4kbm") or {}
+local kbmAnalysis = noctalia.state.get("kbm_analysis") or {}
 
-local selected = {}
+-- device -> preset being started/stopped (or true), while a command runs
 local busy = {}
-local kbmBusy = false
 local sectionOpen = { connected = true, saved = false }
 
 local renderCount = 0
@@ -209,55 +255,82 @@ local function publishActive()
 	noctalia.state.set("active", active)
 end
 
--- Is this the device ds4kbm is configured for?
-local function isKbmDevice(device)
-	return ds4kbm.device ~= nil and noctalia.string.trim(device) == noctalia.string.trim(ds4kbm.device)
+local function kbmRunning(device)
+	return ds4kbm.state == "on" and ds4kbm.device == device
 end
 
-local function kbmOn(device)
-	return ds4kbm.state == "on" and isKbmDevice(device)
+-- The preset running on a device and how ("controller" / "kbm"), or nil.
+-- The preset is "" when input-remapper runs one this plugin did not start
+-- (the daemon reports that something runs, not what).
+local function runningPreset(device)
+	if kbmRunning(device) then
+		return ds4kbm.preset, "kbm"
+	end
+	if running[device] ~= nil then
+		return running[device], "controller"
+	end
+	return nil, nil
+end
+
+-- What actually runs wins over the remembered choice, so the switch never
+-- disagrees with the card (e.g. ds4kbm started from a terminal).
+local function modeOf(entry)
+	if not entry.gamepad then
+		return "controller"
+	end
+	local _, running = runningPreset(entry.name)
+	if running ~= nil then
+		return running
+	end
+	return modes[entry.name] == "kbm" and "kbm" or "controller"
+end
+
+-- { usable, skipped } for a preset in keyboard & mouse mode, or nil while
+-- the service has not analyzed it yet.
+local function kbmInfo(device, preset)
+	local perDevice = kbmAnalysis[device]
+	if type(perDevice) ~= "table" then
+		return nil
+	end
+	return perDevice[preset]
+end
+
+local function kbmUsable(device, preset)
+	local info = kbmInfo(device, preset)
+	return info == nil or (info.usable or 0) > 0
 end
 
 -- ---------------------------------------------------------------------------
 -- actions
 -- ---------------------------------------------------------------------------
 
+local function finish(device)
+	busy[device] = nil
+	requestScan()
+	render()
+end
+
 local function runStart(device, preset)
 	noctalia.runAsync(startCmd(device, preset), function(result)
-		busy[device] = nil
 		if result ~= nil and result.exitCode == 0 then
-			selected[device] = preset
 			active[device] = preset
 			publishActive()
 			dbg("started " .. device .. " -> " .. preset)
 		else
-			local code = "nil"
-			if result ~= nil then
-				code = tostring(result.exitCode)
-			end
-			dbg("START FAILED " .. device .. " -> " .. preset .. " exit=" .. code)
-			noctalia.notifyError(
-				noctalia.tr("notify.start_failed"),
-				errorText(result, "notify.generic_body")
-			)
+			dbg("START FAILED " .. device .. " -> " .. preset .. " exit=" .. tostring(result and result.exitCode))
+			noctalia.notifyError(noctalia.tr("notify.start_failed"), errorText(result, "notify.generic_body"))
 		end
-		render()
+		finish(device)
 	end)
 end
 
-local function startPreset(device, preset)
-	if busy[device] then
-		return
-	end
-	busy[device] = true
-	render()
-
-	-- Never run both at once: ds4kbm holds an exclusive grab on the
-	-- controller, so it has to let go before input-remapper can inject.
-	if kbmOn(device) then
+-- Never run both at once: ds4kbm holds an exclusive grab on the controller,
+-- so it has to let go before input-remapper can inject, and ds4kbm-ctl start
+-- stops input-remapper's injection for the device itself.
+local function startController(device, preset)
+	if kbmRunning(device) then
 		noctalia.runAsync(ds4kbmCmd("stop"), function(_result)
 			dbg("ds4kbm stopped before starting " .. device .. " -> " .. preset)
-			requestScan()
 			runStart(device, preset)
 		end)
 	else
@@ -265,92 +338,133 @@ local function startPreset(device, preset)
 	end
 end
 
-local function toggleKbm(device)
-	if kbmBusy then
-		return
-	end
-	local turningOn = ds4kbm.state ~= "on"
-	kbmBusy = true
-	render()
-
-	noctalia.runAsync(ds4kbmCmd(turningOn and "start" or "stop"), function(result)
-		kbmBusy = false
+local function startKbm(device, preset)
+	local path = presetsRoot() .. "/" .. device .. "/" .. preset .. ".json"
+	noctalia.runAsync(ds4kbmCmd("start " .. shq(path) .. ds4kbmArgs()), function(result)
 		if result ~= nil and result.exitCode == 0 then
-			dbg("ds4kbm " .. (turningOn and "started" or "stopped"))
-			-- ds4kbm-ctl start already released the device from input-remapper.
-			if turningOn and active[device] ~= nil then
+			dbg("ds4kbm started " .. device .. " -> " .. preset)
+			if active[device] ~= nil then
 				active[device] = nil
 				publishActive()
 			end
 		else
-			dbg("DS4KBM " .. (turningOn and "START" or "STOP") .. " FAILED")
-			noctalia.notifyError(
-				noctalia.tr(turningOn and "notify.kbm_start_failed" or "notify.kbm_stop_failed"),
-				errorText(result, "notify.kbm_generic_body")
-			)
+			dbg("DS4KBM START FAILED " .. device .. " -> " .. preset)
+			noctalia.notifyError(noctalia.tr("notify.kbm_start_failed"), errorText(result, "notify.kbm_generic_body"))
 		end
-		-- The service owns `ds4kbm`; ask it to re-check right away.
-		requestScan()
-		render()
+		finish(device)
 	end)
 end
 
-local function stopDevice(device)
-	if busy[device] then
+local function stopRunning(device)
+	if kbmRunning(device) then
+		noctalia.runAsync(ds4kbmCmd("stop"), function(result)
+			if result == nil or result.exitCode ~= 0 then
+				noctalia.notifyError(noctalia.tr("notify.kbm_stop_failed"), errorText(result, "notify.kbm_generic_body"))
+			end
+			dbg("ds4kbm stopped " .. device)
+			finish(device)
+		end)
 		return
 	end
-	busy[device] = true
-	render()
 
 	noctalia.runAsync(stopCmd(device), function(result)
-		busy[device] = nil
 		if result ~= nil and result.exitCode == 0 then
 			active[device] = nil
 			publishActive()
 			dbg("stopped " .. device)
 		else
 			dbg("STOP FAILED " .. device)
-			noctalia.notifyError(
-				noctalia.tr("notify.stop_failed"),
-				errorText(result, "notify.generic_body")
-			)
+			noctalia.notifyError(noctalia.tr("notify.stop_failed"), errorText(result, "notify.generic_body"))
 		end
-		render()
+		finish(device)
 	end)
 end
 
-local function onPresetClicked(device, preset)
-	if kbmOn(device) then
-		return
-	end
-	if active[device] == preset then
-		stopDevice(device)
+-- Run `preset` on `device` in `mode`, replacing whatever runs there now.
+local function startIn(device, preset, mode)
+	busy[device] = preset
+	render()
+	if mode == "kbm" then
+		startKbm(device, preset)
 	else
-		startPreset(device, preset)
+		startController(device, preset)
 	end
 end
 
-local function onDeviceButtonClicked(deviceEntry)
-	local device = deviceEntry.name
-	if active[device] ~= nil then
-		stopDevice(device)
+local function onPresetClicked(entry, preset)
+	local device = entry.name
+	if busy[device] ~= nil then
 		return
 	end
-	local preset = selected[device] or deviceEntry.presets[1]
-	if preset ~= nil then
-		startPreset(device, preset)
+	local mode = modeOf(entry)
+	local current, currentMode = runningPreset(device)
+
+	if current == preset and currentMode == mode then
+		busy[device] = preset
+		render()
+		stopRunning(device)
+	elseif mode == "kbm" and not kbmUsable(device, preset) then
+		return
+	else
+		startIn(device, preset, mode)
+	end
+end
+
+local function onStopClicked(entry)
+	local device = entry.name
+	if busy[device] ~= nil then
+		return
+	end
+	busy[device] = true
+	render()
+	stopRunning(device)
+end
+
+-- Switching while a preset runs moves that preset over to the new mode.
+local function setMode(entry, mode)
+	local device = entry.name
+	if busy[device] ~= nil or modeOf(entry) == mode then
+		return
+	end
+	modes[device] = (mode == "kbm") and "kbm" or nil
+	noctalia.state.set("modes", modes)
+	dbg("mode " .. device .. " -> " .. mode)
+
+	local current = runningPreset(device)
+	if current == nil or current == "" then
+		-- Nothing to move over (or nothing we know the name of).
+		render()
+	elseif mode == "kbm" and not kbmUsable(device, current) then
+		busy[device] = true
+		render()
+		stopRunning(device)
+	else
+		startIn(device, current, mode)
 	end
 end
 
 local function stopEverything()
-	local any = false
+	local targets = {}
 	for device, _ in pairs(active) do
+		targets[device] = true
+	end
+	for device, _ in pairs(running) do
+		targets[device] = true
+	end
+	local any = false
+	for device, _ in pairs(targets) do
 		any = true
 		noctalia.runAsync(stopCmd(device))
 	end
 	if any then
 		active = {}
 		publishActive()
+		requestScan()
+	end
+	if ds4kbm.state == "on" then
+		noctalia.runAsync(ds4kbmCmd("stop"), function(_result)
+			requestScan()
+		end)
 	end
 	render()
 end
@@ -366,7 +480,7 @@ local function splitDevices()
 		if isConnected == nil then
 			isConnected = true
 		end
-		if active[entry.name] ~= nil then
+		if runningPreset(entry.name) ~= nil then
 			isConnected = true
 		end
 
@@ -383,85 +497,48 @@ end
 -- rendering
 -- ---------------------------------------------------------------------------
 
-local function header()
-	return ui.row({ gap = 6, align = "center" }, {
-		ui.glyph({ name = "keyboard", size = 17, color = "primary" }),
-		ui.label({
-			text = noctalia.tr("panel.title"),
-			fontSize = 15,
-			fontWeight = "bold",
-			flexGrow = 1,
-			maxLines = 1,
-		}),
-		ui.button({
-			glyph = "settings",
-			glyphSize = 14,
-			variant = "ghost",
-			controlSize = "sm",
-			tooltip = noctalia.tr("panel.settings"),
-			onClick = function()
-				noctalia.openSettings()
-			end,
-		}),
-		ui.button({
-			glyph = "x",
-			glyphSize = 14,
-			variant = "ghost",
-			controlSize = "sm",
-			tooltip = noctalia.tr("panel.close"),
-			onClick = function()
-				panel.close()
-			end,
-		}),
+local function iconButton(glyph, tooltipKey, onClick)
+	return ui.button({
+		glyph = glyph,
+		glyphSize = 15,
+		variant = "ghost",
+		controlSize = "sm",
+		tooltip = noctalia.tr(tooltipKey),
+		onClick = onClick,
 	})
 end
 
-local function statusCard()
+local function header()
 	local ok = daemon == "ok"
-	local debugOn = noctalia.getConfig("debug_log") ~= false
-
-	local madeByRow = {
-		ui.label({
-			text = noctalia.tr("panel.made_by"),
-			fontSize = 10,
-			color = "on_surface_variant",
-			flexGrow = 1,
-		}),
-	}
-	if debugOn then
-		-- Diagnostic stamp: which build, which VM, how many paints. Kept
-		-- behind the same toggle as the log file itself, so a normal user
-		-- never sees debug scaffolding once things are working.
-		table.insert(madeByRow, ui.label({
-			text = "v" .. PLUGIN_VERSION .. " " .. VM_ID .. " #" .. tostring(renderCount),
-			fontSize = 9,
-			color = "on_surface_variant",
-		}))
-	end
-
-	return ui.column({
-		gap = 2,
-		padding = 10,
-		radius = CARD_RADIUS,
-		fill = CARD_FILL,
-		border = ok and "outline" or "error",
-		borderWidth = 1,
-	}, {
-		ui.row({ gap = 7, align = "center" }, {
-			ui.glyph({
-				name = ok and "circle-filled" or "alert-circle",
-				size = 10,
-				color = ok and "primary" or "error",
-			}),
+	return ui.row({ gap = 10, align = "center" }, {
+		ui.glyph({ name = "keyboard", size = 20, color = "primary" }),
+		ui.column({ gap = 1, flexGrow = 1 }, {
 			ui.label({
-				text = ok and noctalia.tr("panel.daemon_ok") or noctalia.tr("panel.daemon_down"),
-				fontSize = 12,
-				color = ok and "on_surface" or "error",
-				flexGrow = 1,
+				text = noctalia.tr("panel.title"),
+				fontSize = 15,
+				fontWeight = "bold",
 				maxLines = 1,
 			}),
+			ui.row({ gap = 5, align = "center" }, {
+				ui.glyph({ name = "circle-filled", size = 7, color = ok and "primary" or "error" }),
+				ui.label({
+					text = ok and noctalia.tr("panel.daemon_ok") or noctalia.tr("panel.daemon_down"),
+					fontSize = 11,
+					color = ok and "on_surface_variant" or "error",
+					maxLines = 1,
+				}),
+			}),
 		}),
-		ui.row({ paddingH = 17, gap = 6, align = "center" }, madeByRow),
+		iconButton("refresh", "panel.reload", function()
+			dbg("reload clicked")
+			requestScan()
+		end),
+		iconButton("settings", "panel.settings", function()
+			noctalia.openSettings()
+		end),
+		iconButton("x", "panel.close", function()
+			panel.close()
+		end),
 	})
 end
 
@@ -473,7 +550,7 @@ local function sectionHeader(sectionKey, titleKey, count)
 		align = "center",
 		paddingH = 4,
 		paddingV = 4,
-		radius = 8,
+		radius = ROW_RADIUS,
 		onClick = function()
 			sectionOpen[sectionKey] = not open
 			dbg("section " .. sectionKey .. " -> " .. tostring(not open))
@@ -496,146 +573,241 @@ local function sectionHeader(sectionKey, titleKey, count)
 		ui.label({
 			text = tostring(count),
 			fontSize = 11,
+			fontWeight = "bold",
 			color = "on_surface_variant",
 		}),
 	})
 end
 
-local function presetRow(deviceEntry, preset, locked)
-	local device = deviceEntry.name
-	local isActive = active[device] == preset
-
-	local children = {
-		ui.glyph({
-			name = isActive and "circle-filled" or "circle",
-			size = 11,
-			color = isActive and "primary" or "on_surface_variant",
-		}),
+local function stopButton(entry)
+	local isBusy = busy[entry.name] ~= nil
+	return ui.row({
+		key = "stop:" .. entry.name,
+		gap = 6,
+		align = "center",
+		paddingH = 12,
+		paddingV = 6,
+		radius = ROW_RADIUS,
+		border = "error",
+		borderWidth = 1,
+		onClick = (not isBusy) and function()
+			onStopClicked(entry)
+		end or noop,
+	}, {
+		ui.glyph({ name = "player-stop-filled", size = 10, color = "error" }),
 		ui.label({
-			text = preset,
+			text = isBusy and noctalia.tr("panel.working") or noctalia.tr("panel.stop"),
 			fontSize = 12,
-			color = isActive and "primary" or "on_surface",
-			flexGrow = 1,
+			fontWeight = "bold",
+			color = "error",
+		}),
+	})
+end
+
+local function modeSegment(entry, mode, glyph, textKey)
+	local selected = modeOf(entry) == mode
+	local onPrimary = selected and mode == "kbm"
+	local color = onPrimary and "on_primary" or (selected and "on_surface" or "on_surface_variant")
+	local fill = NO_FILL
+	if selected then
+		fill = (mode == "kbm") and "primary" or "on_surface/0.12"
+	end
+	return ui.row({
+		key = "mode:" .. entry.name .. ":" .. mode,
+		gap = 7,
+		align = "center",
+		justify = "center",
+		flexGrow = 1,
+		paddingV = 7,
+		radius = ROW_RADIUS,
+		fill = fill,
+		onClick = function()
+			setMode(entry, mode)
+		end,
+	}, {
+		ui.glyph({ name = glyph, size = 14, color = color }),
+		ui.label({
+			text = noctalia.tr(textKey),
+			fontSize = 12,
+			fontWeight = "bold",
+			color = color,
 			maxLines = 1,
+		}),
+	})
+end
+
+local function modeSwitch(entry)
+	local rows = {
+		ui.label({
+			text = noctalia.tr("panel.games_see"),
+			fontSize = 10,
+			fontWeight = "bold",
+			color = "on_surface_variant",
+		}),
+		ui.row({
+			gap = 4,
+			padding = 3,
+			radius = ROW_RADIUS + 2,
+			border = "outline",
+			borderWidth = 1,
+		}, {
+			modeSegment(entry, "controller", "device-gamepad-2", "panel.mode_controller"),
+			modeSegment(entry, "kbm", "mouse", "panel.mode_kbm"),
 		}),
 	}
 
-	if isActive then
-		table.insert(children, ui.label({
-			text = noctalia.tr("panel.setted"),
-			fontSize = 10,
-			fontWeight = "bold",
-			color = "primary",
+	if modeOf(entry) == "kbm" then
+		table.insert(rows, ui.row({ gap = 8, align = "center" }, {
+			ui.label({
+				text = noctalia.tr("panel.kbm_hint"),
+				fontSize = 11,
+				color = "on_surface_variant",
+				flexGrow = 1,
+				maxLines = 3,
+			}),
+			ui.row({
+				paddingH = 6,
+				paddingV = 4,
+				radius = ROW_RADIUS,
+				onClick = function()
+					noctalia.openSettings()
+				end,
+			}, {
+				ui.label({
+					text = noctalia.tr("panel.tune"),
+					fontSize = 12,
+					fontWeight = "bold",
+					color = "primary",
+				}),
+			}),
 		}))
 	end
 
+	return ui.column({ gap = 6 }, rows)
+end
+
+local function presetRow(entry, preset)
+	local device = entry.name
+	local mode = modeOf(entry)
+	local current, currentMode = runningPreset(device)
+	local isRunning = current == preset and currentMode == mode
+	local isBusy = busy[device] ~= nil
+
+	-- In keyboard & mouse mode, say how much of the preset ds4kbm can't do.
+	local note = nil
+	local usable = true
+	if mode == "kbm" then
+		local info = kbmInfo(device, preset)
+		usable = kbmUsable(device, preset)
+		if not usable then
+			note = noctalia.tr("panel.kbm_unusable")
+		elseif info ~= nil and (info.skipped or 0) > 0 then
+			note = noctalia.trp("panel.kbm_skipped", info.skipped)
+		end
+	end
+
+	local text = {
+		ui.label({
+			text = preset,
+			fontSize = 13,
+			fontWeight = "bold",
+			color = isRunning and "primary" or "on_surface",
+			maxLines = 1,
+		}),
+	}
+	if note ~= nil then
+		table.insert(text, ui.label({
+			text = note,
+			fontSize = 10,
+			color = "on_surface_variant",
+			maxLines = 2,
+		}))
+	end
+
+	local trailing
+	if busy[device] == preset then
+		trailing = ui.label({ text = noctalia.tr("panel.working"), fontSize = 11, color = "on_surface_variant" })
+	elseif isRunning then
+		trailing = ui.label({
+			text = noctalia.tr("panel.active"),
+			fontSize = 10,
+			fontWeight = "bold",
+			color = "primary",
+		})
+	else
+		trailing = ui.glyph({ name = "player-play-filled", size = 9, color = "on_surface_variant" })
+	end
+
+	local clickable = usable and not isBusy
 	return ui.row({
 		-- Key is derived only from identity, never from position, so folding a
 		-- section cannot renumber a row and confuse the reconciler.
 		key = "preset:" .. device .. ":" .. preset,
-		gap = 8,
+		gap = 10,
 		align = "center",
-		paddingH = 7,
-		paddingV = 5,
-		radius = 8,
-		fill = isActive and "primary/0.16" or nil,
-		-- Locked while keyboard + mouse mode owns the controller.
-		opacity = locked and 0.4 or nil,
-		onClick = (not locked) and function()
-			onPresetClicked(device, preset)
-		end or nil,
-	}, children)
-end
-
-local function kbmRow(deviceEntry, dimmed)
-	local device = deviceEntry.name
-	local on = kbmOn(device)
-
-	local children = {
+		paddingH = 10,
+		paddingV = 7,
+		radius = ROW_RADIUS,
+		fill = isRunning and "primary/0.16" or NO_FILL,
+		opacity = usable and 1 or 0.4,
+		onClick = clickable and function()
+			onPresetClicked(entry, preset)
+		end or noop,
+	}, {
 		ui.glyph({
-			name = "device-gamepad-2",
+			name = isRunning and "circle-dot" or "circle",
 			size = 13,
-			color = on and "primary" or "on_surface_variant",
+			color = isRunning and "primary" or "on_surface_variant",
 		}),
-		ui.label({
-			text = noctalia.tr("panel.kbm_mode"),
-			fontSize = 12,
-			color = on and "primary" or "on_surface",
-			flexGrow = 1,
-			maxLines = 1,
-		}),
-		ui.button({
-			text = kbmBusy and noctalia.tr("panel.working")
-				or (on and noctalia.tr("panel.kbm_on") or noctalia.tr("panel.kbm_off")),
-			fontSize = 11,
-			variant = on and "primary" or "ghost",
-			controlSize = "sm",
-			-- A controller that is not plugged in has nothing to grab.
-			enabled = not kbmBusy and not dimmed,
-			tooltip = dimmed and noctalia.tr("panel.kbm_disconnected") or nil,
-			onClick = function()
-				toggleKbm(device)
-			end,
-		}),
-	}
-
-	return ui.row({
-		key = "kbm:" .. device,
-		gap = 8,
-		align = "center",
-		paddingH = 7,
-		paddingV = 4,
-		radius = 8,
-		fill = on and "primary/0.16" or nil,
-	}, children)
+		ui.column({ gap = 1, flexGrow = 1 }, text),
+		trailing,
+	})
 end
 
-local function deviceCard(deviceEntry, dimmed)
-	local device = deviceEntry.name
-	local locked = kbmOn(device)
-	local isActive = active[device] ~= nil or locked
-	local isBusy = busy[device] == true
+local function deviceCard(entry, dimmed)
+	local device = entry.name
+	local current = runningPreset(device)
+	local isRunning = current ~= nil
 
-	local rows = {
-		ui.row({ gap = 8, align = "center" }, {
-			ui.label({
-				text = deviceEntry.display,
-				fontSize = 13,
-				fontWeight = "bold",
-				color = isActive and "primary" or "on_surface",
-				flexGrow = 1,
-				maxLines = 1,
-			}),
-			ui.button({
-				text = isBusy and noctalia.tr("panel.working")
-					or (active[device] ~= nil and noctalia.tr("panel.stop") or noctalia.tr("panel.start")),
-				fontSize = 11,
-				variant = active[device] ~= nil and "destructive" or "primary",
-				controlSize = "sm",
-				enabled = not isBusy and #deviceEntry.presets > 0,
-				onClick = function()
-					onDeviceButtonClicked(deviceEntry)
-				end,
-			}),
-		}),
-	}
-
-	if isKbmDevice(device) then
-		table.insert(rows, kbmRow(deviceEntry, dimmed))
-		if locked then
-			table.insert(rows, ui.row({ paddingH = 7, paddingV = 2 }, {
-				ui.label({
-					text = noctalia.tr("panel.kbm_locked"),
-					fontSize = 10,
-					color = "on_surface_variant",
-					maxLines = 2,
-				}),
-			}))
-		end
+	local subtitle
+	if isRunning and current ~= "" then
+		subtitle = noctalia.tr("panel.running") .. " · " .. current
+	elseif isRunning then
+		subtitle = noctalia.tr("panel.running")
+	else
+		subtitle = noctalia.trp("panel.preset_count", #entry.presets)
 	end
 
-	if #deviceEntry.presets == 0 then
-		table.insert(rows, ui.row({ paddingH = 7, paddingV = 4 }, {
+	local titleRow = {
+		ui.column({ gap = 2, flexGrow = 1 }, {
+			ui.label({
+				text = entry.display,
+				fontSize = 14,
+				fontWeight = "bold",
+				color = isRunning and "primary" or "on_surface",
+				-- Long names wrap instead of being cut off.
+				maxLines = 2,
+			}),
+			ui.label({
+				text = subtitle,
+				fontSize = 11,
+				color = "on_surface_variant",
+				maxLines = 1,
+			}),
+		}),
+	}
+	if isRunning then
+		table.insert(titleRow, stopButton(entry))
+	end
+
+	local rows = { ui.row({ gap = 8, align = "center" }, titleRow) }
+
+	if entry.gamepad then
+		table.insert(rows, modeSwitch(entry))
+	end
+
+	if #entry.presets == 0 then
+		table.insert(rows, ui.row({ paddingH = 10, paddingV = 4 }, {
 			ui.label({
 				text = noctalia.tr("panel.no_presets"),
 				fontSize = 11,
@@ -643,20 +815,22 @@ local function deviceCard(deviceEntry, dimmed)
 			}),
 		}))
 	else
-		for _, preset in ipairs(deviceEntry.presets) do
-			table.insert(rows, presetRow(deviceEntry, preset, locked))
+		local list = {}
+		for _, preset in ipairs(entry.presets) do
+			table.insert(list, presetRow(entry, preset))
 		end
+		table.insert(rows, ui.column({ gap = 2 }, list))
 	end
 
 	return ui.column({
 		key = "device:" .. device,
-		gap = 3,
-		padding = 10,
+		gap = 8,
+		padding = 12,
 		radius = CARD_RADIUS,
 		fill = CARD_FILL,
-		border = isActive and "primary" or "outline",
+		border = isRunning and "primary" or "outline",
 		borderWidth = 1,
-		opacity = dimmed and 0.6 or nil,
+		opacity = dimmed and 0.6 or 1,
 	}, rows)
 end
 
@@ -697,33 +871,39 @@ local function emptyState()
 end
 
 local function footer()
-	return ui.row({ gap = 8 }, {
-		ui.button({
-			glyph = "refresh",
-			glyphSize = 13,
-			text = noctalia.tr("panel.reload"),
-			fontSize = 11,
-			variant = "ghost",
-			controlSize = "sm",
-			flexGrow = 1,
-			onClick = function()
-				dbg("reload clicked")
-				requestScan()
-			end,
+	local anything = next(running) ~= nil or next(active) ~= nil or ds4kbm.state == "on"
+	local right = {
+		ui.label({
+			text = noctalia.tr("panel.made_by"),
+			fontSize = 10,
+			color = "on_surface_variant",
 		}),
+	}
+	if noctalia.getConfig("debug_log") ~= false then
+		-- Diagnostic stamp: which build, which VM, how many paints. Kept
+		-- behind the same toggle as the log file itself, so a normal user
+		-- never sees debug scaffolding once things are working.
+		table.insert(right, 1, ui.label({
+			text = "v" .. PLUGIN_VERSION .. " " .. VM_ID .. " #" .. tostring(renderCount),
+			fontSize = 9,
+			color = "on_surface_variant",
+		}))
+	end
+
+	return ui.row({ gap = 8, align = "center" }, {
 		ui.button({
-			glyph = "player-stop",
-			glyphSize = 13,
+			glyph = "player-stop-filled",
+			glyphSize = 12,
 			text = noctalia.tr("panel.stop_all"),
-			fontSize = 11,
+			fontSize = 12,
 			variant = "ghost",
 			controlSize = "sm",
-			flexGrow = 1,
-			enabled = next(active) ~= nil,
+			enabled = anything,
 			onClick = function()
 				stopEverything()
 			end,
 		}),
+		ui.row({ gap = 8, align = "center", justify = "end", flexGrow = 1 }, right),
 	})
 end
 
@@ -755,7 +935,7 @@ local function body()
 		end
 	end
 
-	return ui.column({ gap = 8 }, blocks)
+	return ui.column({ gap = 10 }, blocks)
 end
 
 local function scrollArea()
@@ -773,15 +953,19 @@ render = function(force)
 		return
 	end
 
+	-- Everything the tree depends on. Anything left out here would let a
+	-- state change be skipped as "nothing changed".
 	local signature = noctalia.json.encode({
 		devices = devices,
 		active = active,
+		running = running,
 		daemon = daemon,
+		modes = modes,
 		ds4kbm = ds4kbm,
-		kbmBusy = kbmBusy,
+		kbmAnalysis = kbmAnalysis,
 		busy = busy,
 		sections = sectionOpen,
-		selected = selected,
+		debug = noctalia.getConfig("debug_log"),
 	})
 
 	-- Never dedup during the settling window right after an open: the surface
@@ -815,7 +999,7 @@ render = function(force)
 	)
 
 	panel.render(ui.column({
-		gap = 10,
+		gap = 12,
 		padding = ROOT_PADDING,
 		-- The whole point: a real height here is what creates the leftover
 		-- space that the scroll area's flexGrow claims. Without it the footer
@@ -823,9 +1007,8 @@ render = function(force)
 		height = ROOT_HEIGHT,
 	}, {
 		header(),
-		statusCard(),
-		ui.separator({ spacing = 1 }),
 		tree,
+		ui.separator({ spacing = 1 }),
 		footer(),
 	}))
 end
@@ -846,13 +1029,28 @@ noctalia.state.watch("active", function(value)
 	render()
 end)
 
+noctalia.state.watch("running", function(value)
+	running = copyMap(value)
+	render()
+end)
+
 noctalia.state.watch("daemon", function(value)
 	daemon = value or "unknown"
 	render()
 end)
 
+noctalia.state.watch("modes", function(value)
+	modes = copyMap(value)
+	render()
+end)
+
 noctalia.state.watch("ds4kbm", function(value)
 	ds4kbm = (type(value) == "table") and value or {}
+	render()
+end)
+
+noctalia.state.watch("kbm_analysis", function(value)
+	kbmAnalysis = (type(value) == "table") and value or {}
 	render()
 end)
 
@@ -879,8 +1077,11 @@ function onOpen(_context)
 
 	devices = noctalia.state.get("devices") or devices
 	active = copyMap(noctalia.state.get("active"))
+	running = copyMap(noctalia.state.get("running"))
 	daemon = noctalia.state.get("daemon") or daemon
+	modes = copyMap(noctalia.state.get("modes"))
 	ds4kbm = noctalia.state.get("ds4kbm") or ds4kbm
+	kbmAnalysis = noctalia.state.get("kbm_analysis") or kbmAnalysis
 
 	-- Root cause of the 0.2.x/0.3.0/0.3.1 "flip-flopping look": sectionOpen
 	-- used to persist across close/open. Whatever it was last toggled to (by

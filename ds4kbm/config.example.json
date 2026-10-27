@@ -5,7 +5,10 @@
     "axis": "ABS_X",
     "scale": 0.9,
     "deadzone": 0.08,
-    "expo": 1.0
+    "expo": 1.0,
+    "smoothing": true,
+    "min_cutoff": 0.5,
+    "beta": 1.0
   },
   "cursor_y": 0.5,
   "triggers": {
