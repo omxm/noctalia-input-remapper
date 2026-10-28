@@ -13,6 +13,11 @@
 --                  keyboard & mouse (absent = "controller")
 --   ds4kbm       : { state = "on" | "off", device, preset, path }
 --   kbm_analysis : map device name -> preset name -> { usable, skipped }
+--   pad_coverage : map device name -> preset name -> { full, missing } for
+--                  connected gamepads (see padhide/singlepad.py)
+--   pad_hide     : map device name -> "hidden" (all its gamepad nodes are
+--                  hidden) | "partial" (some are) | "failed" (should be
+--                  hidden, the helper failed)
 --
 -- The panel writes back to `active` and `modes`; this service persists both
 -- so they survive a Noctalia restart. `running` and `ds4kbm` are only ever
@@ -23,12 +28,16 @@
 -- When a device comes back after a disconnect, the preset in `active` is
 -- applied again (input-remapper does not do that by itself). ds4kbm needs no
 -- help there: it keeps running and grabs the controller again on its own.
+--
+-- While a gamepad runs a full ("single pad") preset in Controller mode, the
+-- original controller and input-remapper's forwarded copy are hidden from
+-- games through the root helper noctalia-padhide (see "hiding" below).
 
 -- ---------------------------------------------------------------------------
 -- instrumentation (0.3.1 diagnostic build)
 -- ---------------------------------------------------------------------------
 
-local PLUGIN_VERSION = "0.6.1"
+local PLUGIN_VERSION = "0.7.0"
 
 local VM_ID = string.format("%04x", (noctalia.nowMs() % 65536))
 	.. string.format("%02x", math.random(0, 255))
@@ -149,6 +158,52 @@ local function ds4kbmArgs()
 		.. " --pwm-min-pulse " .. num("kbm_pwm_min_pulse", 0.02)
 end
 
+-- Root helper that hides a controller from games, run through sudo with a
+-- NOPASSWD rule for this one path (README, "Hiding the original controller").
+local HIDE_HELPER = "/usr/local/bin/noctalia-padhide"
+
+local function padhideCmd(sub, device)
+	return "sudo -n " .. HIDE_HELPER .. " " .. sub .. " " .. shq(device)
+end
+
+local function singlepadCmd(sub)
+	local dir = noctalia.pluginDir() or "."
+	return "python3 " .. shq(dir .. "/padhide/singlepad.py") .. " " .. sub
+end
+
+-- input-remapper-control lists devices with the caller's permissions before
+-- talking to the daemon, so it reports a hidden controller as unknown. Any
+-- control command for a device in pad_hide is therefore preceded by making
+-- it visible; the next refresh hides it again if it should be.
+-- While such a command runs, `hide_hold` (device -> start time) keeps the
+-- service from hiding the device again under its feet.
+local function revealPrefix(device)
+	local hide = noctalia.state.get("pad_hide")
+	if type(hide) == "table" and hide[device] ~= nil then
+		return "sudo -n " .. HIDE_HELPER .. " show " .. shq(device) .. " >/dev/null 2>&1; "
+	end
+	return ""
+end
+
+local function holdHiding(device, on)
+	local hold = {}
+	local current = noctalia.state.get("hide_hold")
+	if type(current) == "table" then
+		for key, value in pairs(current) do
+			hold[key] = value
+		end
+	end
+	hold[device] = on and noctalia.nowMs() or nil
+	noctalia.state.set("hide_hold", hold)
+end
+
+-- A hold older than this is stale (its command's callback never came).
+local HOLD_MS = 30000
+
+local function hidingEnabled()
+	return noctalia.getConfig("hide_original") ~= false
+end
+
 -- ---------------------------------------------------------------------------
 -- persistence
 -- ---------------------------------------------------------------------------
@@ -217,6 +272,32 @@ local function analyzePresets(devices)
 				if noctalia.json.encode(decoded) ~= noctalia.json.encode(analysis[device]) then
 					analysis[device] = decoded
 					noctalia.state.set("kbm_analysis", analysis)
+				end
+			end)
+		end
+	end
+end
+
+-- Which presets keep input-remapper's forwarded copy silent, per connected
+-- gamepad. Only those can run with the controller hidden.
+local coverage = {}
+
+local function analyzeCoverage(devices)
+	for _, entry in ipairs(devices) do
+		if entry.gamepad and entry.present then
+			local device = entry.name
+			noctalia.runAsync(singlepadCmd("analyze " .. shq(presetsRoot() .. "/" .. device)), function(result)
+				if result == nil or result.exitCode ~= 0 then
+					dbg("coverage failed for " .. device)
+					return
+				end
+				local decoded = noctalia.json.decode(result.stdout or "")
+				if type(decoded) ~= "table" then
+					return
+				end
+				if noctalia.json.encode(decoded) ~= noctalia.json.encode(coverage[device]) then
+					coverage[device] = decoded
+					noctalia.state.set("pad_coverage", coverage)
 				end
 			end)
 		end
@@ -353,8 +434,10 @@ local function reapplyReconnected(devices, before)
 		if preset ~= nil and entry.present and before[device] == false and not reapplying[device] then
 			reapplying[device] = true
 			dbg("reconnected " .. device .. ", re-applying " .. preset)
-			noctalia.runAsync(startCmd(device, preset), function(result)
+			holdHiding(device, true)
+			noctalia.runAsync(revealPrefix(device) .. startCmd(device, preset), function(result)
 				reapplying[device] = nil
+				holdHiding(device, false)
 				if result == nil or result.exitCode ~= 0 then
 					dbg("RE-APPLY FAILED " .. device .. " -> " .. preset)
 				end
@@ -364,12 +447,125 @@ local function reapplyReconnected(devices, before)
 	end
 end
 
+-- ---------------------------------------------------------------------------
+-- hiding
+--
+-- input-remapper's grab silences the controller but does not remove it: SDL
+-- still lists it, usually first, and a game that only reads the first
+-- controller (Roblox character movement in Sober) gets nothing. So while a
+-- gamepad runs a full preset in Controller mode, its nodes (the original and
+-- the forwarded copy, which shares the name) are made root-only and games'
+-- open handles are revoked; noctalia-padhide does the root part.
+--
+-- Every refresh compares what should be hidden with what scan.sh could open
+-- and fixes the difference, so starting, stopping, Stop all, the widget's
+-- right click, a daemon going away, a reconnect (new nodes start visible) and
+-- presets started from the GUI all end up right without hooks of their own.
+-- ---------------------------------------------------------------------------
+
+local hidePending = {} -- device -> true while the helper runs for it
+local hideFailed = {}  -- device -> { sub, at } of the last failed run, until one succeeds
+local lastRun = {}     -- device -> { sub, at } of the last successful run
+-- A run that succeeded is not repeated this soon even if the next scan still
+-- disagrees, so an unexpected mismatch can never turn into a sudo loop.
+local RERUN_MS = 10000
+-- A failed run is retried after this long (a node can vanish mid-run while
+-- input-remapper recreates its forwarded copy); only the first failure in a
+-- row is announced.
+local RETRY_MS = 30000
+local lastPadHideJson = nil
+
+local function runHelper(sub, device)
+	hidePending[device] = true
+	dbg("padhide " .. sub .. " " .. device)
+	noctalia.runAsync(padhideCmd(sub, device), function(result)
+		hidePending[device] = nil
+		if result == nil or result.exitCode ~= 0 then
+			dbg("PADHIDE " .. sub .. " FAILED " .. device)
+			local again = hideFailed[device] ~= nil and hideFailed[device].sub == sub
+			hideFailed[device] = { sub = sub, at = noctalia.nowMs() }
+			if not again then
+				local detail = noctalia.string.trim((result and result.stderr) or "")
+				if detail == "" then
+					detail = noctalia.tr("notify.hide_generic_body")
+				end
+				noctalia.notifyError(
+					noctalia.tr(sub == "hide" and "notify.hide_failed" or "notify.show_failed"),
+					detail
+				)
+			end
+		else
+			hideFailed[device] = nil
+			lastRun[device] = { sub = sub, at = noctalia.nowMs() }
+		end
+		noctalia.state.set("scan_request", noctalia.nowMs())
+	end)
+end
+
+-- pads: name -> { total, hidden } from scan.sh's `pad` lines.
+local function reconcileHiding(devices, pads, running)
+	local want = {}
+	if hidingEnabled() then
+		for _, entry in ipairs(devices) do
+			local preset = running[entry.name]
+			local info = coverage[entry.name] and preset and coverage[entry.name][preset]
+			if entry.gamepad and entry.present and preset ~= nil and preset ~= ""
+				and type(info) == "table" and info.full == true then
+				want[entry.name] = true
+			end
+		end
+	end
+
+	local function mayRun(device, sub)
+		local now = noctalia.nowMs()
+		local last, failed = lastRun[device], hideFailed[device]
+		return not (failed ~= nil and failed.sub == sub and now - failed.at < RETRY_MS)
+			and not (last ~= nil and last.sub == sub and now - last.at < RERUN_MS)
+	end
+
+	local hold = noctalia.state.get("hide_hold")
+	if type(hold) ~= "table" then
+		hold = {}
+	end
+
+	local padHide = {}
+	for device, info in pairs(pads) do
+		local held = type(hold[device]) == "number" and noctalia.nowMs() - hold[device] < HOLD_MS
+		if hidePending[device] or held then
+			-- Wait for the running helper or control command; the next refresh
+			-- looks again.
+		elseif want[device] then
+			if info.hidden < info.total and mayRun(device, "hide") then
+				runHelper("hide", device)
+			end
+		elseif info.hidden > 0 and mayRun(device, "show") then
+			runHelper("show", device)
+		end
+		if want[device] and hideFailed[device] ~= nil and hideFailed[device].sub == "hide" then
+			padHide[device] = "failed"
+		elseif info.hidden > 0 then
+			padHide[device] = (info.hidden == info.total) and "hidden" or "partial"
+		end
+	end
+	for device, failed in pairs(hideFailed) do
+		if failed.sub == "hide" and not want[device] then
+			hideFailed[device] = nil
+		end
+	end
+
+	local encoded = noctalia.json.encode(padHide)
+	if encoded ~= lastPadHideJson then
+		lastPadHideJson = encoded
+		noctalia.state.set("pad_hide", padHide)
+	end
+end
+
 local requestRefresh -- forward declaration
 
 local function applyScan(stdout)
 	local listed = nil -- folder -> presets, when this run listed them
 	local order = {}
-	local inputs, states = {}, {}
+	local inputs, states, pads = {}, {}, {}
 	local sig, daemonOk, kbmPath = nil, false, nil
 
 	for line in string.gmatch(stdout, "[^\n]+") do
@@ -379,6 +575,16 @@ local function applyScan(stdout)
 			table.insert(inputs, rec)
 		elseif kind == "state" then
 			states[rec[2]] = rec[3]
+		elseif kind == "pad" then
+			local info = pads[rec[2]]
+			if info == nil then
+				info = { total = 0, hidden = 0 }
+				pads[rec[2]] = info
+			end
+			info.total = info.total + 1
+			if rec[4] == "0" then
+				info.hidden = info.hidden + 1
+			end
 		elseif kind == "dir" then
 			table.insert(order, rec[2])
 		elseif kind == "preset" and listed ~= nil then
@@ -474,13 +680,19 @@ local function applyScan(stdout)
 	end
 
 	reapplyReconnected(devices, before)
+	reconcileHiding(devices, pads, running)
 
+	-- Re-analyze when the device list changed or a preset file was added,
+	-- renamed or edited (the fingerprint covers file mtimes).
 	local encoded = noctalia.json.encode(devices)
-	if encoded ~= lastDevicesJson then
-		lastDevicesJson = encoded
-		dbg("publish devices=" .. tostring(#devices))
-		noctalia.state.set("devices", devices)
+	if encoded ~= lastDevicesJson or listed ~= nil then
+		if encoded ~= lastDevicesJson then
+			lastDevicesJson = encoded
+			dbg("publish devices=" .. tostring(#devices))
+			noctalia.state.set("devices", devices)
+		end
 		analyzePresets(devices)
+		analyzeCoverage(devices)
 	end
 end
 
@@ -527,7 +739,10 @@ local function stopAll()
 		end
 	end
 	for device, _ in pairs(targets) do
-		noctalia.runAsync(stopCmd(device))
+		holdHiding(device, true)
+		noctalia.runAsync(revealPrefix(device) .. stopCmd(device), function(_result)
+			holdHiding(device, false)
+		end)
 	end
 	noctalia.state.set("active", {})
 	noctalia.runAsync(ds4kbmCmd("stop"), function(_result)
@@ -566,6 +781,8 @@ noctalia.state.set("active", startupActive)
 noctalia.state.set("running", {})
 noctalia.state.set("modes", loadJson("modes.json"))
 noctalia.state.set("kbm_analysis", analysis)
+noctalia.state.set("pad_coverage", coverage)
+noctalia.state.set("pad_hide", {})
 requestRefresh()
 
 -- ---------------------------------------------------------------------------
@@ -611,6 +828,9 @@ end
 
 function onConfigChanged()
 	lastDaemonOk = nil
+	-- A changed setting is a fresh chance for a helper that failed (e.g. one
+	-- installed after the failure), without waiting for the retry delay.
+	hideFailed = {}
 	refreshAll()
 
 	-- New tuning takes effect right away: restart a running ds4kbm with the

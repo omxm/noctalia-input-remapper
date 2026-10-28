@@ -85,6 +85,7 @@ different generations at the same time.
 | Middle-click the widget | Widget settings (standard Noctalia behavior) |
 | Click a preset row | Start it. Click the running row again to stop it |
 | Stop on a running device card | Stop whatever runs on that device |
+| Make single-pad copy | Shown under a gamepad running a preset that cannot be hidden from games, see [Hiding the original controller](#hiding-the-original-controller) |
 | Games see it as: Controller / Keyboard & Mouse | Gamepads only. How the controller's presets are run, see [Keyboard & Mouse mode](#keyboard--mouse-mode) |
 | Tune | Open the plugin settings (keyboard & mouse tuning lives there) |
 | Reload (header) | Rescan presets and re-check the daemon |
@@ -218,15 +219,114 @@ it again when it reconnects.
 
 ---
 
+## Hiding the original controller
+
+input-remapper grabs the real controller, but a grab only silences it - the
+device node stays, and games using SDL still list it, usually as the *first*
+controller. A game that only reads the first controller (Roblox character
+movement in Sober, for example) then reads a controller that never moves,
+while the preset's output arrives on input-remapper's virtual gamepad listed
+after it.
+
+So while a gamepad runs a preset in Controller mode, the plugin hides the
+original from games: its device node becomes readable by root only, and the
+handles games already hold on it are revoked. Games drop the controller
+right away, even while running, and are left with input-remapper's gamepad
+as the first one. input-remapper runs as root and keeps reading. When the
+preset stops (or Stop all, the widget's right click, the daemon going away,
+the setting turned off), the controller is made visible again and games
+pick it up without a restart.
+
+The card says `Original controller hidden from games` while this is in
+effect. Turn it off with the `hide_original` setting.
+
+### Only single-pad presets can be hidden
+
+input-remapper passes every event no mapping takes to a *forwarded copy* of
+the controller, which has the same name and also counts as a controller. A
+preset that maps only some buttons (say, one that just swaps Cross and
+Circle) therefore splits the controller across two virtual pads: the mapped
+buttons on input-remapper's gamepad, the sticks and everything else on the
+forwarded copy. Hiding the copy would lose the sticks, and not hiding it
+leaves the game with two controllers, so such a preset is left alone.
+
+A *single-pad* preset maps every button and axis of the controller, so the
+forwarded copy never says anything and is hidden together with the original.
+When a gamepad runs a preset that is not single-pad, the card says how many
+buttons and axes it leaves out and offers **Make single-pad copy**: it writes
+`<preset> Single Pad.json` next to it, with the same mappings plus a 1:1
+mapping to input-remapper's gamepad for every button and axis that was left
+out (axes without an extra deadzone; games have their own). The original
+preset is not changed. Start the copy instead of the original.
+
+The controller has to be connected for this: which buttons and axes it has is
+read from the kernel. Combinations do not count as covering their buttons.
+
+### Installing the helper
+
+Changing a device node's permissions and revoking other programs' handles
+needs root, so it is done by a small root-owned helper, `noctalia-padhide`,
+that the plugin runs with `sudo -n` (it never prompts). It only touches
+`/dev/input/event*` character devices the kernel lists as a joystick with
+exactly the given name, refuses input-remapper's own virtual gamepad, and
+only revokes handles of non-root processes.
+
+Install it where you cannot change it, then allow exactly that one command
+without a password:
+
+```sh
+# from the plugin directory
+sudo install -o root -g root -m 0755 padhide/noctalia-padhide /usr/local/bin/noctalia-padhide
+
+# /etc/sudoers must read files from /etc/sudoers.d (prints "@includedir /etc/sudoers.d")
+sudo grep -n includedir /etc/sudoers
+
+# opens an editor; add the line below (with your user name), save and quit
+sudo visudo -f /etc/sudoers.d/noctalia-padhide
+# "visudo: no editor found" means vi is not installed; name another editor:
+sudo env EDITOR=nano visudo -f /etc/sudoers.d/noctalia-padhide
+```
+
+```
+youruser ALL=(root) NOPASSWD: /usr/local/bin/noctalia-padhide
+```
+
+`visudo` checks the syntax before saving, so a typo cannot lock you out of
+`sudo`. Check that it works without a password (this only restores the
+default permissions, so it is safe to run any time):
+
+```sh
+sudo -k
+sudo -n /usr/local/bin/noctalia-padhide show 'Wireless Controller'   # your controller's name
+```
+
+Without the helper everything else keeps working; a single-pad preset just
+runs without hiding, and the card says `Couldn't hide the original
+controller`. After installing the helper, change any plugin setting (or
+restart Noctalia) to make the plugin try again.
+
+The installed copy does not update with the plugin. When a new version
+changes `padhide/noctalia-padhide`, run the `install` line again.
+
+To remove it:
+
+```sh
+sudo rm /etc/sudoers.d/noctalia-padhide /usr/local/bin/noctalia-padhide
+```
+
+If a controller ever stays hidden (for example, Noctalia was closed while a
+preset ran and the preset was stopped from the input-remapper GUI), reconnect
+it, or run `sudo /usr/local/bin/noctalia-padhide show '<name>'`.
+
+---
+
 ## Tip: swapping face buttons without a preset (Sober / SDL games)
 
 Not a plugin feature, just a game-side setting worth knowing. Games built on
 SDL (Sober, the Roblox runner, bundles SDL3) read the controller's button
 layout from the `SDL_GAMECONTROLLERCONFIG` environment variable. Swapping
-buttons there needs no input-remapper preset, creates no virtual device, and
-avoids the problem described under
-[Known limitations](#known-limitations) where a game ends up reading a
-silent controller.
+buttons there needs no input-remapper preset, no virtual device, and no
+[hidden controller](#hiding-the-original-controller).
 
 For Sober, a DS4 over Bluetooth with Cross ↔ Circle and Triangle ↔ Square
 swapped:
@@ -274,6 +374,7 @@ Settings → Plugins → the gear icon on this plugin's row.
 | `scroll_height` | `0` | List height. `0` = automatic; set a number only if the footer gets pushed off |
 | `debug_log` | `false` | Write diagnostics to `<pluginDataDir>/debug.log`. Only needed while troubleshooting |
 | `on_startup` | `restore` | What to do with the remembered injection state when Noctalia starts |
+| `hide_original` | `true` | Hide the original controller from games while it runs a single-pad preset in Controller mode. Needs the helper, see [Hiding the original controller](#hiding-the-original-controller) |
 | `kbm_scale` | `0.9` | Keyboard & mouse: full stick deflection moves the cursor this fraction of the way from the screen center to the edge |
 | `kbm_deadzone` | `0.08` | Keyboard & mouse: fraction of the stick range ignored around center |
 | `kbm_cursor_y` | `0.5` | Keyboard & mouse: fixed vertical cursor position, `0` = top of the screen, `1` = bottom. Move it off the game's on-screen buttons |
@@ -385,13 +486,35 @@ A device counts as a gamepad when the kernel gives it a `js` handler in
 
 **Communication between entries**
 `service` is the single source of truth: it publishes `devices` / `active` /
-`running` / `daemon` / `modes` / `ds4kbm` / `kbm_analysis` to
-`noctalia.state`, and `panel` / `widget` watch them. `panel` writes back to
+`running` / `daemon` / `modes` / `ds4kbm` / `kbm_analysis` /
+`pad_coverage` / `pad_hide` to `noctalia.state`, and `panel` / `widget` watch them. `panel` writes back to
 `active` (the preset it asked for) and `modes`, which the service persists.
 `running` (from D-Bus) and `ds4kbm` (from `ds4kbm-ctl status`) are only
 written by `service`; after every start or stop the panel bumps
 `scan_request` so the service re-checks right away. `kbm_analysis` comes from
-`ds4kbm-ctl analyze`, run whenever the preset list changes.
+`ds4kbm-ctl analyze` and `pad_coverage` from `padhide/singlepad.py analyze`,
+both run whenever the device list changes or a preset file is added, renamed
+or edited.
+
+**Hiding without hooks**
+Every refresh, `scan.sh` reports each gamepad node and whether the plugin's
+user can open it, and the service compares that with what should be hidden
+(gamepads running a single-pad preset in Controller mode, while
+`hide_original` is on). Any difference is fixed by one `noctalia-padhide`
+run. Starting, stopping, Stop all, the widget's right click, a daemon going
+away, a preset started from the input-remapper GUI and a reconnect (the new
+nodes start visible) all end up right without code of their own. A failed
+run is not retried until a setting changes, and a successful one is not
+repeated for 10 s even if the next scan still disagrees, so a surprise can
+never turn into a `sudo` loop.
+
+`input-remapper-control` lists devices with your permissions before it talks
+to the daemon, so it reports a hidden controller as unknown. Every start or
+stop for a hidden device therefore makes it visible first, and holds off
+hiding (`hide_hold`) until the command returns; the next refresh hides it
+again if it should be. Switching a hidden controller to keyboard &
+mouse mode works too: ds4kbm retries opening the controller every 2 s, and
+the next refresh makes it visible.
 
 **Props that toggle**
 The panel never passes `nil` for a prop that changes between renders (`fill`,
@@ -423,20 +546,20 @@ retained node, so "off" is always spelled out explicitly.
   single instance; starting it for a second gamepad replaces the first.
 - **The preset name of a GUI-started run is unknown**: the daemon does not
   say which preset it injects, so such a run shows as `Running` only.
-- **SDL games may read the silent original controller in Controller
-  mode**: input-remapper grabs the real controller, but the grab only
-  silences it - the device node stays, and SDL still lists it, usually
-  first. The preset's output comes from input-remapper's virtual devices
-  listed after it. A game that only reads the first controller (Roblox
-  character movement in Sober, for example) then gets no input, while one
-  that reads every controller works. There is no fix on the plugin side that
-  keeps the raw controller usable: SDL can ignore controllers only by
-  vendor / product ID (`SDL_GAMECONTROLLER_IGNORE_DEVICES`), and
-  input-remapper's forwarded copy carries the same IDs as the original, so
-  hiding them hides the controller when no preset runs as well. For button
-  swaps, use [`SDL_GAMECONTROLLERCONFIG`](#tip-swapping-face-buttons-without-a-preset-sober--sdl-games)
-  instead; for presets that map to keys, keyboard & mouse mode is unaffected
-  because the game only uses the keyboard and pointer.
+- **Only single-pad presets hide the original controller**: a preset that
+  leaves buttons or axes to input-remapper's forwarded copy cannot be hidden
+  (see [Only single-pad presets can be hidden](#only-single-pad-presets-can-be-hidden)),
+  so a game that only reads the first controller still gets no input with
+  it. Use its single-pad copy, or for plain button swaps
+  [`SDL_GAMECONTROLLERCONFIG`](#tip-swapping-face-buttons-without-a-preset-sober--sdl-games).
+  Hiding also needs the root helper; without it every preset behaves this
+  way.
+- **Hiding is per device name**: the original and input-remapper's
+  forwarded copy share a name, which is how both are found. Two identical
+  controllers connected at once would be hidden together.
+- **Hiding outlives Noctalia**: a controller hidden while Noctalia quits
+  stays hidden until Noctalia runs again and sees the preset stopped, or the
+  controller reconnects.
 - **Re-applying needs connection detection**: with `detect_connected` off
   the service still watches `/proc/bus/input/devices` for reconnects, but if
   that file cannot be read, nothing is re-applied.

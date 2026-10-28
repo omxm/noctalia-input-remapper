@@ -1,6 +1,6 @@
 id           = "haru/input-remapper"
 name         = "Input Remapper"
-version      = "0.6.1"
+version      = "0.7.0"
 plugin_api   = 18
 author       = "haru"
 license      = "MIT"
@@ -81,6 +81,16 @@ options = [
   { value = "clear",    label_key = "settings.on_startup.clear" },
   { value = "stop_all", label_key = "settings.on_startup.stop_all" },
 ]
+
+# Hide a gamepad's original controller from games while it runs a full preset
+# in Controller mode. Needs the root helper noctalia-padhide (see README).
+
+[[setting]]
+key             = "hide_original"
+type            = "bool"
+label_key       = "settings.hide_original.label"
+description_key = "settings.hide_original.description"
+default         = true
 
 # Keyboard & Mouse mode (ds4kbm). Passed to ds4kbm.py as command-line options;
 # a running instance is restarted when any of these change. `step` matters:
