@@ -211,7 +211,7 @@ instance, so it also switches presets. Concurrent calls are serialized with
 it runs, so a second instance refuses to start no matter how it was launched.
 `ds4kbm-ctl` uses that lock as the source of truth, so it also finds and stops
 an instance started by hand. `stop` waits until the process is gone and the
-grab is released.
+grab is released, then empties the pidfile.
 
 If ds4kbm loses the controller (Bluetooth drop), it keeps running and grabs
 it again when it reconnects.
@@ -293,10 +293,26 @@ safety. Device names can contain spaces, commas, and leading whitespace (some
 AJAZZ receivers report seven leading spaces), so every interpolated value goes
 through POSIX single-quote escaping (`'` -> `'\''`).
 
+**Refreshing without blocking**
+Noctalia gives every script callback a small time budget and disables a
+plugin whose callbacks keep overrunning it. On a busy system (a game
+compiling shaders, a game running uncapped) even light work in a callback can
+overrun, so the service's `update()` does no I/O at all. One `scan.sh`
+process per refresh gathers everything - input devices (pre-filtered with
+awk), preset folders, daemon and injector state over D-Bus, ds4kbm status -
+and prints short tab-separated lines that the callback only has to split. A
+refresh never starts while the previous one is still running. Preset folders
+are only listed again when their fingerprint (folder and file mtimes)
+changes. `scan.sh` can be run by hand to see exactly what the service sees:
+
+```sh
+sh scan.sh ~/.config/input-remapper-2/presets
+```
+
 **State tracking**
 Whether a device is injecting comes from the daemon itself: every refresh,
-the service calls the daemon's `get_state` over D-Bus with `dbus-send` (part
-of dbus, so no extra dependency), one shell call for all devices. Starting
+the service asks the daemon's `get_state` over D-Bus with `dbus-send` (part
+of dbus, so no extra dependency). Starting
 and stopping from the input-remapper GUI therefore shows up in the panel too.
 
 The daemon reports *that* a device injects, not *which* preset, so the plugin

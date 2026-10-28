@@ -1,6 +1,6 @@
 id           = "haru/input-remapper"
 name         = "Input Remapper"
-version      = "0.6.0"
+version      = "0.6.1"
 plugin_api   = 18
 author       = "haru"
 license      = "MIT"
