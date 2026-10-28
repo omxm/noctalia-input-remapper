@@ -36,6 +36,30 @@ local function ds4kbmCmd(sub)
 		.. sub
 end
 
+-- See revealPrefix in service.luau: input-remapper-control cannot find a
+-- hidden controller, so make it visible first.
+local HIDE_HELPER = "/usr/local/bin/noctalia-padhide"
+
+local function revealPrefix(device)
+	local hide = noctalia.state.get("pad_hide")
+	if type(hide) == "table" and hide[device] ~= nil then
+		return "sudo -n " .. HIDE_HELPER .. " show " .. shq(device) .. " >/dev/null 2>&1; "
+	end
+	return ""
+end
+
+local function holdHiding(device, on)
+	local hold = {}
+	local current = noctalia.state.get("hide_hold")
+	if type(current) == "table" then
+		for key, value in pairs(current) do
+			hold[key] = value
+		end
+	end
+	hold[device] = on and noctalia.nowMs() or nil
+	noctalia.state.set("hide_hold", hold)
+end
+
 local function truncate(text, limit)
 	if limit == nil or limit < 4 or #text <= limit then
 		return text
@@ -157,7 +181,10 @@ function onRightClick()
 	local stopped = 0
 	for device, _ in pairs(targets) do
 		stopped = stopped + 1
-		noctalia.runAsync(controlCmd() .. " --command stop --device " .. shq(device))
+		holdHiding(device, true)
+		noctalia.runAsync(revealPrefix(device) .. controlCmd() .. " --command stop --device " .. shq(device), function(_result)
+			holdHiding(device, false)
+		end)
 	end
 	if ds4kbm.state == "on" then
 		stopped = stopped + 1

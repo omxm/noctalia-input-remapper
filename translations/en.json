@@ -81,5 +81,17 @@
   "panel.kbm_unusable": "No mapping works as keyboard & mouse",
   "widget.kbm_suffix": "(keyboard & mouse)",
   "settings.kbm_cursor_y.label": "Keyboard & Mouse: cursor height",
-  "settings.kbm_cursor_y.description": "Where the cursor sits vertically, 0 = top of the screen, 1 = bottom. Move it off the game's on-screen buttons."
+  "settings.kbm_cursor_y.description": "Where the cursor sits vertically, 0 = top of the screen, 1 = bottom. Move it off the game's on-screen buttons.",
+  "settings.hide_original.label": "Hide the original controller from games",
+  "settings.hide_original.description": "While a gamepad runs a full (single-pad) preset in Controller mode, make the original controller unreadable for games so they only see input-remapper's gamepad. Needs the noctalia-padhide helper, see the README.",
+  "panel.hidden": "Original controller hidden from games",
+  "panel.hide_failed": "Couldn't hide the original controller. See \"Hiding the original controller\" in the README.",
+  "panel.not_full.one": "1 input isn't mapped, so the original controller can't be hidden from games.",
+  "panel.not_full.other": "{count} inputs aren't mapped, so the original controller can't be hidden from games.",
+  "panel.make_copy": "Make single-pad copy",
+  "notify.copy_created": "Single-pad copy created",
+  "notify.copy_failed": "Couldn't create the single-pad copy",
+  "notify.hide_failed": "Couldn't hide the original controller",
+  "notify.show_failed": "Couldn't make the controller visible again",
+  "notify.hide_generic_body": "noctalia-padhide returned an error. See \"Hiding the original controller\" in the README."
 }

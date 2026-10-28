@@ -10,6 +10,7 @@
 #   dir     <folder>                 one per preset folder
 #   preset  <folder> <name>          only when the signature changed
 #   input   <name> <phys> <uinput 0|1> <js 0|1>   from /proc/bus/input/devices
+#   pad     <name> <eventN> <readable 0|1>        every gamepad node; 0 = hidden
 #   state   <folder> <state>         input-remapper injector state (D-Bus)
 #   daemon  <ok|down>
 #   ds4kbm  <on|off> [preset path]
@@ -56,6 +57,19 @@ awk -v OFS='\t' '
     /^$/          { flush() }
     END           { flush() }
 ' /proc/bus/input/devices
+
+# Gamepad nodes and whether we may open them: noctalia-padhide makes a
+# controller root-only while input-remapper runs it.
+for js in /sys/class/input/js*; do
+    [ -e "$js/device/name" ] || continue
+    IFS= read -r name <"$js/device/name"
+    for ev in "$js"/device/event*; do
+        [ -e "$ev" ] || continue
+        node=${ev##*/}
+        if [ -r "/dev/input/$node" ]; then readable=1; else readable=0; fi
+        printf 'pad\t%s\t%s\t%s\n' "$name" "$node" "$readable"
+    done
+done
 
 if dbus hello string:scan >/dev/null; then
     printf 'daemon\tok\n'

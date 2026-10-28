@@ -1,7 +1,7 @@
 -- haru/input-remapper : panel.luau
 --
 -- The pop-up surface. Reads devices/active/running/daemon/modes/ds4kbm/
--- kbm_analysis from noctalia.state (the service publishes them), runs
+-- kbm_analysis/pad_coverage/pad_hide from noctalia.state (the service publishes them), runs
 -- input-remapper-control or ds4kbm-ctl on click, and writes `active` (what we
 -- asked for) / `modes` back to state so the widget and the service follow
 -- along. What is shown as running comes from `running`, which the service
@@ -12,10 +12,14 @@
 --   keyboard & mouse  ds4kbm grabs the controller and runs the same preset,
 --                     exposing only a keyboard and a pointer to games
 --
+-- In Controller mode the service hides the original controller from games
+-- while a full preset runs; the card says so, and offers a single-pad copy
+-- of a preset that is not full.
+--
 -- With debug_log on it writes <pluginDataDir>/debug.log and prints its
 -- version + VM id in the footer.
 
-local PLUGIN_VERSION = "0.6.1"
+local PLUGIN_VERSION = "0.7.0"
 
 -- ---------------------------------------------------------------------------
 -- instrumentation
@@ -140,6 +144,35 @@ local function ds4kbmArgs()
 		.. " --pwm-min-pulse " .. num("kbm_pwm_min_pulse", 0.02)
 end
 
+-- See revealPrefix in service.luau: input-remapper-control (and ds4kbm-ctl,
+-- which calls it) cannot find a hidden controller, so make it visible first.
+local HIDE_HELPER = "/usr/local/bin/noctalia-padhide"
+
+local function revealPrefix(device)
+	local hide = noctalia.state.get("pad_hide")
+	if type(hide) == "table" and hide[device] ~= nil then
+		return "sudo -n " .. HIDE_HELPER .. " show " .. shq(device) .. " >/dev/null 2>&1; "
+	end
+	return ""
+end
+
+local function holdHiding(device, on)
+	local hold = {}
+	local current = noctalia.state.get("hide_hold")
+	if type(current) == "table" then
+		for key, value in pairs(current) do
+			hold[key] = value
+		end
+	end
+	hold[device] = on and noctalia.nowMs() or nil
+	noctalia.state.set("hide_hold", hold)
+end
+
+local function singlepadCmd(sub)
+	local dir = noctalia.pluginDir() or "."
+	return "python3 " .. shq(dir .. "/padhide/singlepad.py") .. " " .. sub
+end
+
 local function copyMap(source)
 	local out = {}
 	if type(source) == "table" then
@@ -236,6 +269,8 @@ local daemon = noctalia.state.get("daemon") or "unknown"
 local modes = copyMap(noctalia.state.get("modes"))
 local ds4kbm = noctalia.state.get("ds4kbm") or {}
 local kbmAnalysis = noctalia.state.get("kbm_analysis") or {}
+local padCoverage = noctalia.state.get("pad_coverage") or {}
+local padHide = noctalia.state.get("pad_hide") or {}
 
 -- device -> preset being started/stopped (or true), while a command runs
 local busy = {}
@@ -300,18 +335,30 @@ local function kbmUsable(device, preset)
 	return info == nil or (info.usable or 0) > 0
 end
 
+-- { full, missing } for a preset, or nil while unknown (not analyzed yet, or
+-- the controller is not connected).
+local function coverageInfo(device, preset)
+	local perDevice = padCoverage[device]
+	if type(perDevice) ~= "table" then
+		return nil
+	end
+	return perDevice[preset]
+end
+
 -- ---------------------------------------------------------------------------
 -- actions
 -- ---------------------------------------------------------------------------
 
 local function finish(device)
+	holdHiding(device, false)
 	busy[device] = nil
 	requestScan()
 	render()
 end
 
 local function runStart(device, preset)
-	noctalia.runAsync(startCmd(device, preset), function(result)
+	holdHiding(device, true)
+	noctalia.runAsync(revealPrefix(device) .. startCmd(device, preset), function(result)
 		if result ~= nil and result.exitCode == 0 then
 			active[device] = preset
 			publishActive()
@@ -340,7 +387,8 @@ end
 
 local function startKbm(device, preset)
 	local path = presetsRoot() .. "/" .. device .. "/" .. preset .. ".json"
-	noctalia.runAsync(ds4kbmCmd("start " .. shq(path) .. ds4kbmArgs()), function(result)
+	holdHiding(device, true)
+	noctalia.runAsync(revealPrefix(device) .. ds4kbmCmd("start " .. shq(path) .. ds4kbmArgs()), function(result)
 		if result ~= nil and result.exitCode == 0 then
 			dbg("ds4kbm started " .. device .. " -> " .. preset)
 			if active[device] ~= nil then
@@ -367,7 +415,8 @@ local function stopRunning(device)
 		return
 	end
 
-	noctalia.runAsync(stopCmd(device), function(result)
+	holdHiding(device, true)
+	noctalia.runAsync(revealPrefix(device) .. stopCmd(device), function(result)
 		if result ~= nil and result.exitCode == 0 then
 			active[device] = nil
 			publishActive()
@@ -443,6 +492,28 @@ local function setMode(entry, mode)
 	end
 end
 
+-- Write "<preset> Single Pad" next to the preset: the same mappings plus a
+-- 1:1 gamepad mapping for every button and axis it leaves out.
+local function makeSinglePadCopy(entry, preset)
+	local device = entry.name
+	if busy[device] ~= nil then
+		return
+	end
+	busy[device] = true
+	render()
+	local path = presetsRoot() .. "/" .. device .. "/" .. preset .. ".json"
+	noctalia.runAsync(singlepadCmd("copy " .. shq(path)), function(result)
+		if result ~= nil and result.exitCode == 0 then
+			local name = noctalia.string.trim(result.stdout or "")
+			dbg("single-pad copy " .. device .. " -> " .. name)
+			noctalia.notify(noctalia.tr("notify.copy_created"), name)
+		else
+			noctalia.notifyError(noctalia.tr("notify.copy_failed"), errorText(result, "notify.generic_body"))
+		end
+		finish(device)
+	end)
+end
+
 local function stopEverything()
 	local targets = {}
 	for device, _ in pairs(active) do
@@ -454,7 +525,10 @@ local function stopEverything()
 	local any = false
 	for device, _ in pairs(targets) do
 		any = true
-		noctalia.runAsync(stopCmd(device))
+		holdHiding(device, true)
+		noctalia.runAsync(revealPrefix(device) .. stopCmd(device), function(_result)
+			holdHiding(device, false)
+		end)
 	end
 	if any then
 		active = {}
@@ -686,6 +760,68 @@ local function modeSwitch(entry)
 	return ui.column({ gap = 6 }, rows)
 end
 
+local function noteLabel(text, color)
+	return ui.label({
+		text = text,
+		fontSize = 11,
+		color = color,
+		flexGrow = 1,
+		maxLines = 3,
+	})
+end
+
+-- Controller mode only: is the original controller hidden from games, and if
+-- it cannot be (the preset is not full), offer a copy that can.
+local function hidingNote(entry)
+	if noctalia.getConfig("hide_original") == false or modeOf(entry) ~= "controller" then
+		return nil
+	end
+	local device = entry.name
+	local current = running[device]
+	if current == nil or current == "" then
+		return nil
+	end
+
+	local state = padHide[device]
+	if state == "hidden" then
+		return ui.row({ gap = 6, align = "center" }, {
+			ui.glyph({ name = "eye-off", size = 13, color = "primary" }),
+			noteLabel(noctalia.tr("panel.hidden"), "on_surface_variant"),
+		})
+	elseif state == "failed" then
+		return ui.row({ gap = 6, align = "center" }, {
+			ui.glyph({ name = "alert-triangle", size = 13, color = "error" }),
+			noteLabel(noctalia.tr("panel.hide_failed"), "error"),
+		})
+	end
+
+	local info = coverageInfo(device, current)
+	if type(info) ~= "table" or info.full == true then
+		return nil
+	end
+	local isBusy = busy[device] ~= nil
+	return ui.row({ gap = 8, align = "center" }, {
+		noteLabel(noctalia.trp("panel.not_full", info.missing or 0), "on_surface_variant"),
+		ui.row({
+			key = "copy:" .. device,
+			paddingH = 6,
+			paddingV = 4,
+			radius = ROW_RADIUS,
+			onClick = (not isBusy) and function()
+				makeSinglePadCopy(entry, current)
+			end or noop,
+		}, {
+			ui.label({
+				text = isBusy and noctalia.tr("panel.working") or noctalia.tr("panel.make_copy"),
+				fontSize = 12,
+				fontWeight = "bold",
+				color = "primary",
+				maxLines = 2,
+			}),
+		}),
+	})
+end
+
 local function presetRow(entry, preset)
 	local device = entry.name
 	local mode = modeOf(entry)
@@ -804,6 +940,10 @@ local function deviceCard(entry, dimmed)
 
 	if entry.gamepad then
 		table.insert(rows, modeSwitch(entry))
+		local note = hidingNote(entry)
+		if note ~= nil then
+			table.insert(rows, note)
+		end
 	end
 
 	if #entry.presets == 0 then
@@ -963,6 +1103,9 @@ render = function(force)
 		modes = modes,
 		ds4kbm = ds4kbm,
 		kbmAnalysis = kbmAnalysis,
+		padCoverage = padCoverage,
+		padHide = padHide,
+		hideOriginal = noctalia.getConfig("hide_original"),
 		busy = busy,
 		sections = sectionOpen,
 		debug = noctalia.getConfig("debug_log"),
@@ -1054,6 +1197,16 @@ noctalia.state.watch("kbm_analysis", function(value)
 	render()
 end)
 
+noctalia.state.watch("pad_coverage", function(value)
+	padCoverage = (type(value) == "table") and value or {}
+	render()
+end)
+
+noctalia.state.watch("pad_hide", function(value)
+	padHide = (type(value) == "table") and value or {}
+	render()
+end)
+
 -- ---------------------------------------------------------------------------
 -- lifecycle
 -- ---------------------------------------------------------------------------
@@ -1082,6 +1235,8 @@ function onOpen(_context)
 	modes = copyMap(noctalia.state.get("modes"))
 	ds4kbm = noctalia.state.get("ds4kbm") or ds4kbm
 	kbmAnalysis = noctalia.state.get("kbm_analysis") or kbmAnalysis
+	padCoverage = noctalia.state.get("pad_coverage") or padCoverage
+	padHide = noctalia.state.get("pad_hide") or padHide
 
 	-- Root cause of the 0.2.x/0.3.0/0.3.1 "flip-flopping look": sectionOpen
 	-- used to persist across close/open. Whatever it was last toggled to (by

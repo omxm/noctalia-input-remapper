@@ -81,5 +81,17 @@
   "panel.kbm_unusable": "キーボード & マウスで使える割り当てがありません",
   "widget.kbm_suffix": "（キーボード & マウス）",
   "settings.kbm_cursor_y.label": "Keyboard & Mouse: カーソルの高さ",
-  "settings.kbm_cursor_y.description": "カーソルの縦の位置。0 = 画面の上端、1 = 下端。ゲームの画面上のボタンと重ならない高さにしてください。"
+  "settings.kbm_cursor_y.description": "カーソルの縦の位置。0 = 画面の上端、1 = 下端。ゲームの画面上のボタンと重ならない高さにしてください。",
+  "settings.hide_original.label": "元のコントローラーをゲームから隠す",
+  "settings.hide_original.description": "Controller モードで全部を1台にまとめたプリセット(single pad)を動かしている間、元のコントローラーをゲームから読めなくし、input-remapper のゲームパッドだけを見せます。noctalia-padhide ヘルパーが必要です。README を参照してください。",
+  "panel.hidden": "元のコントローラーをゲームから隠しています",
+  "panel.hide_failed": "元のコントローラーを隠せませんでした。README の「Hiding the original controller」を参照してください。",
+  "panel.not_full.one": "1 個のボタン・軸が未割り当てのため、元のコントローラーをゲームから隠せません。",
+  "panel.not_full.other": "{count} 個のボタン・軸が未割り当てのため、元のコントローラーをゲームから隠せません。",
+  "panel.make_copy": "Single pad のコピーを作る",
+  "notify.copy_created": "Single pad のコピーを作りました",
+  "notify.copy_failed": "Single pad のコピーを作れませんでした",
+  "notify.hide_failed": "元のコントローラーを隠せませんでした",
+  "notify.show_failed": "コントローラーを元に戻せませんでした",
+  "notify.hide_generic_body": "noctalia-padhide がエラーを返しました。README の「Hiding the original controller」を参照してください。"
 }
