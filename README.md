@@ -218,6 +218,48 @@ it again when it reconnects.
 
 ---
 
+## Tip: swapping face buttons without a preset (Sober / SDL games)
+
+Not a plugin feature, just a game-side setting worth knowing. Games built on
+SDL (Sober, the Roblox runner, bundles SDL3) read the controller's button
+layout from the `SDL_GAMECONTROLLERCONFIG` environment variable. Swapping
+buttons there needs no input-remapper preset, creates no virtual device, and
+avoids the problem described under
+[Known limitations](#known-limitations) where a game ends up reading a
+silent controller.
+
+For Sober, a DS4 over Bluetooth with Cross ↔ Circle and Triangle ↔ Square
+swapped:
+
+```sh
+flatpak override --user --env='SDL_GAMECONTROLLERCONFIG=050000004c050000cc09000000810000,PS4 Controller (face buttons swapped),a:b1,b:b0,x:b2,y:b3,back:b8,dpdown:h0.4,dpleft:h0.8,dpright:h0.2,dpup:h0.1,guide:b10,leftshoulder:b4,leftstick:b11,lefttrigger:a2,leftx:a0,lefty:a1,rightshoulder:b5,rightstick:b12,righttrigger:a5,rightx:a3,righty:a4,start:b9,platform:Linux,' org.vinegarhq.Sober
+```
+
+Fully quit and relaunch Sober afterwards; the variable is only read at
+startup. To undo:
+
+```sh
+flatpak override --user --unset-env=SDL_GAMECONTROLLERCONFIG org.vinegarhq.Sober
+```
+
+- The line is SDL's stock DS4 mapping with `a`/`b` and `x`/`y` pointing at
+  each other's buttons. Drop `x:b2,y:b3` and put back `x:b3,y:b2` to swap
+  only Cross ↔ Circle.
+- The leading GUID is built from the kernel's bus / vendor / product /
+  version IDs. It differs over USB, or for another controller; print yours
+  with:
+
+  ```sh
+  d=/sys/class/input/js0/device/id
+  le() { echo "$(cut -c3-4 $1)$(cut -c1-2 $1)"; }
+  echo "$(le $d/bustype)0000$(le $d/vendor)0000$(le $d/product)0000$(le $d/version)0000"
+  ```
+
+- Run the controller without a preset (or in keyboard & mouse mode) while
+  using this; a Controller-mode preset on top would remap the buttons twice.
+
+---
+
 ## Settings
 
 Settings → Plugins → the gear icon on this plugin's row.
@@ -381,6 +423,20 @@ retained node, so "off" is always spelled out explicitly.
   single instance; starting it for a second gamepad replaces the first.
 - **The preset name of a GUI-started run is unknown**: the daemon does not
   say which preset it injects, so such a run shows as `Running` only.
+- **SDL games may read the silent original controller in Controller
+  mode**: input-remapper grabs the real controller, but the grab only
+  silences it - the device node stays, and SDL still lists it, usually
+  first. The preset's output comes from input-remapper's virtual devices
+  listed after it. A game that only reads the first controller (Roblox
+  character movement in Sober, for example) then gets no input, while one
+  that reads every controller works. There is no fix on the plugin side that
+  keeps the raw controller usable: SDL can ignore controllers only by
+  vendor / product ID (`SDL_GAMECONTROLLER_IGNORE_DEVICES`), and
+  input-remapper's forwarded copy carries the same IDs as the original, so
+  hiding them hides the controller when no preset runs as well. For button
+  swaps, use [`SDL_GAMECONTROLLERCONFIG`](#tip-swapping-face-buttons-without-a-preset-sober--sdl-games)
+  instead; for presets that map to keys, keyboard & mouse mode is unaffected
+  because the game only uses the keyboard and pointer.
 - **Re-applying needs connection detection**: with `detect_connected` off
   the service still watches `/proc/bus/input/devices` for reconnects, but if
   that file cannot be read, nothing is re-applied.
