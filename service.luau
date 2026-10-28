@@ -18,6 +18,8 @@
 -- so they survive a Noctalia restart. `running` and `ds4kbm` are only ever
 -- written here; the panel bumps `scan_request` after every start or stop.
 --
+-- All of it comes from one scan.sh run per refresh (see "refresh" below).
+--
 -- When a device comes back after a disconnect, the preset in `active` is
 -- applied again (input-remapper does not do that by itself). ds4kbm needs no
 -- help there: it keeps running and grabs the controller again on its own.
@@ -26,7 +28,7 @@
 -- instrumentation (0.3.1 diagnostic build)
 -- ---------------------------------------------------------------------------
 
-local PLUGIN_VERSION = "0.6.0"
+local PLUGIN_VERSION = "0.6.1"
 
 local VM_ID = string.format("%04x", (noctalia.nowMs() % 65536))
 	.. string.format("%02x", math.random(0, 255))
@@ -187,142 +189,18 @@ local function loadJson(file)
 end
 
 -- ---------------------------------------------------------------------------
--- connected devices
+-- keyboard & mouse mode (ds4kbm)
 -- ---------------------------------------------------------------------------
 
 -- Gamepads seen so far, remembered so a disconnected controller still gets
 -- its "games see it as" switch in the Saved section.
 local knownGamepads = loadJson("gamepads.json")
 
--- /proc/bus/input/devices lists every evdev device the kernel currently knows
--- about, one block per device, with lines like:
---     N: Name="       AJAZZ 2.4G 8K"
---     P: Phys=usb-0000:0a:00.3-2.4/input0
---     S: Sysfs=/devices/virtual/misc/uhid/0005:054C:09CC.0008/input/input25
---     H: Handlers=event25 js0
--- It is world-readable and generated in-kernel, so this needs no root, no
--- D-Bus, and no call into input-remapper.
---
--- Copies made by input-remapper / ds4kbm (Phys "input-remapper" / "ds4kbm")
--- carry the real device's name, so they are left out: otherwise a controller
--- would look connected for as long as its copy exists. A `js` handler marks a
--- gamepad, unless the node is a uinput device (/devices/virtual/input/...).
---
--- Returns two sets (exact names, trimmed names), or nil when the file cannot
--- be read - in which case callers should treat every device as connected
--- rather than hiding things that are actually plugged in.
-local function connectedNames()
-	local raw = noctalia.readFile("/proc/bus/input/devices")
-	if raw == nil then
-		noctalia.log("input-remapper: cannot read /proc/bus/input/devices, showing every device")
-		return nil
-	end
-
-	local exact, trimmed = {}, {}
-	local found = false
-	local learned = false
-	for block in string.gmatch(raw .. "\n\n", "(.-)\n%s*\n") do
-		local name = string.match(block, 'N: Name="(.-)"%s*\n') or string.match(block, 'N: Name="(.-)"%s*$')
-		local phys = string.match(block, "P: Phys=([^\n]*)") or ""
-		local uinput = string.find(block, "S: Sysfs=/devices/virtual/input/", 1, true) ~= nil
-		local handlers = string.match(block, "H: Handlers=([^\n]*)") or ""
-		if name ~= nil and phys ~= "input-remapper" and phys ~= "ds4kbm" then
-			found = true
-			exact[name] = true
-			trimmed[trim(name)] = true
-			if not uinput and string.find(" " .. handlers, " js%d") and knownGamepads[trim(name)] ~= true then
-				knownGamepads[trim(name)] = true
-				learned = true
-			end
-		end
-	end
-	if learned then
-		saveJson("gamepads.json", knownGamepads)
-	end
-
-	if not found then
-		return nil
-	end
-	return exact, trimmed
-end
-
--- ---------------------------------------------------------------------------
--- scanning
--- ---------------------------------------------------------------------------
-
--- Device names and preset names come straight from the directory tree, so no
--- root privileges and no D-Bus round trip are needed to build the list.
-local function scanDevices()
-	local root = presetsRoot()
-	local entries = noctalia.listDir(root)
-	if entries == nil then
-		noctalia.log("input-remapper: cannot read " .. root)
-		return {}
-	end
-
-	local hideEmpty = noctalia.getConfig("hide_empty_devices")
-	if hideEmpty == nil then
-		hideEmpty = true
-	end
-
-	local exactSet, trimmedSet = connectedNames()
-	local detect = noctalia.getConfig("detect_connected") ~= false
-
-	local devices = {}
-	for _, name in ipairs(entries) do
-		local full = root .. "/" .. name
-		local info = noctalia.fileInfo(full)
-		if info ~= nil and info.isDir then
-			local files = noctalia.listDir(full)
-			local presets = {}
-			if files ~= nil then
-				for _, file in ipairs(files) do
-					if #file > 5 and string.sub(file, -5) == ".json" then
-						table.insert(presets, string.sub(file, 1, #file - 5))
-					end
-				end
-			end
-			table.sort(presets, function(a, b)
-				return string.lower(a) < string.lower(b)
-			end)
-
-			-- Exact match first; fall back to a whitespace-insensitive compare
-			-- so a folder that lost the device name's padding still matches.
-			-- `present` is what the kernel says; `connected` is what the list
-			-- shows, which the user can switch off (everything "connected").
-			local present = true
-			if exactSet ~= nil then
-				present = (exactSet[name] == true) or (trimmedSet[trim(name)] == true)
-			end
-			local connected = present or not detect
-
-			if #presets > 0 or not hideEmpty then
-				table.insert(devices, {
-					name = name,
-					display = trim(name),
-					presets = presets,
-					connected = connected,
-					present = present,
-					gamepad = knownGamepads[trim(name)] == true,
-				})
-			end
-		end
-	end
-
-	table.sort(devices, function(a, b)
-		return string.lower(a.display) < string.lower(b.display)
-	end)
-	return devices
-end
-
--- ---------------------------------------------------------------------------
--- keyboard & mouse mode (ds4kbm)
--- ---------------------------------------------------------------------------
-
 local analysis = {}
 
 -- How many mappings of each preset ds4kbm can reproduce. Only gamepads can
--- run in keyboard & mouse mode, so only their folders are analyzed.
+-- run in keyboard & mouse mode, so only their folders are analyzed. Runs only
+-- when the preset tree or the device list changed.
 local function analyzePresets(devices)
 	for _, entry in ipairs(devices) do
 		if entry.gamepad then
@@ -357,113 +235,116 @@ local function publishDs4kbm()
 	end
 end
 
-local function checkDs4kbm()
-	noctalia.runAsync(ds4kbmCmd("status"), function(result)
-		local path = nil
-		if result ~= nil and result.exitCode == 0 then
-			path = string.match(result.stdout or "", "\n([^\n]+)")
-		end
-
-		if path == nil then
-			ds4kbm = { state = "off" }
-		else
-			local device, preset = string.match(path, "([^/]+)/([^/]+)%.json%s*$")
-			ds4kbm = { state = "on", device = device, preset = preset, path = path }
-		end
-
-		-- ds4kbm releases the controller from input-remapper when it starts,
-		-- so a remembered preset for that device is no longer injecting.
-		if ds4kbm.device ~= nil then
-			local current = noctalia.state.get("active")
-			if type(current) == "table" and current[ds4kbm.device] ~= nil then
-				local copy = {}
-				for k, v in pairs(current) do
-					copy[k] = v
-				end
-				copy[ds4kbm.device] = nil
-				noctalia.state.set("active", copy)
-			end
-		end
-
-		publishDs4kbm()
-	end)
-end
-
 -- ---------------------------------------------------------------------------
--- publishing
+-- refresh
+--
+-- Noctalia gives every script callback a small time budget, and a busy system
+-- (a game compiling shaders, say) can make even light work blow through it;
+-- after a few overruns the plugin gets disabled. So update() does no I/O at
+-- all: one scan.sh process gathers everything (input devices, preset folders,
+-- daemon and injector state over D-Bus, ds4kbm status) and prints short
+-- tab-separated lines, which the callback below only has to split.
 -- ---------------------------------------------------------------------------
 
--- ---------------------------------------------------------------------------
--- input-remapper injection state (D-Bus) and re-applying after reconnects
--- ---------------------------------------------------------------------------
+local cachedTree = {}      -- array of { name, presets }, from the last listing
+local treeSig = ""         -- scan.sh fingerprint of that listing
+local wasPresent = {}      -- device -> present at the previous refresh
+local reapplying = {}      -- device -> true while a re-apply command runs
+local lastDevicesJson = nil
+local lastDaemonOk = nil
 
-local wasPresent = {}   -- device -> present at the previous scan
-local reapplying = {}   -- device -> true while a re-apply command runs
+local scanning = false     -- a scan.sh run is in flight
+local rescanQueued = false -- another refresh was asked for meanwhile
 
 local function intents()
 	local value = noctalia.state.get("active")
 	return (type(value) == "table") and value or {}
 end
 
--- One shell call asks the daemon for every device's injector state, one line
--- per device. dbus-send ships with dbus itself, so nothing new is needed.
-local function statesCmd(devices)
-	local names = {}
-	for _, entry in ipairs(devices) do
-		table.insert(names, shq("string:" .. entry.name))
+local function split(line)
+	local out = {}
+	local pos = 1
+	while true do
+		local tab = string.find(line, "\t", pos, true)
+		if tab == nil then
+			table.insert(out, string.sub(line, pos))
+			return out
+		end
+		table.insert(out, string.sub(line, pos, tab - 1))
+		pos = tab + 1
 	end
-	return "for arg in "
-		.. table.concat(names, " ")
-		.. "; do dbus-send --system --print-reply=literal --dest=inputremapper.Control"
-		.. " /inputremapper/Control inputremapper.Control.get_state \"$arg\" 2>/dev/null || printf ERR; echo; done"
 end
 
--- `before` maps device -> present at the scan before this one.
-local function checkStates(devices, before)
-	if #devices == 0 then
-		return
-	end
-	noctalia.runAsync(statesCmd(devices), function(result)
-		if result == nil or result.exitCode ~= 0 then
-			return
-		end
-		local states = {}
-		for line in string.gmatch((result.stdout or "") .. "\n", "([^\n]*)\n") do
-			table.insert(states, trim(line))
-		end
+local function scanCmd()
+	local dir = noctalia.pluginDir() or "."
+	return "DS4KBM_CTL="
+		.. shq(dir .. "/ds4kbm/ds4kbm-ctl")
+		.. " sh "
+		.. shq(dir .. "/scan.sh")
+		.. " "
+		.. shq(presetsRoot())
+		.. " "
+		.. shq(treeSig)
+end
 
-		local wanted = intents()
-		local running = {}
-		local dropped = false
-		for i, entry in ipairs(devices) do
-			local device = entry.name
-			local state = states[i] or "ERR"
-			-- The daemon keeps saying RUNNING after the device is unplugged;
-			-- only a present device really injects. Its preset stays in
-			-- `active` so it is re-applied when the device comes back.
-			if (state == "RUNNING" or state == "STARTING") and entry.present then
-				running[device] = wanted[device] or ""
-			elseif wanted[device] ~= nil and entry.present and before[device] == true and not reapplying[device] then
-				-- Plugged in for two scans in a row and still not injecting:
-				-- stopped elsewhere (GUI) or failed, so stop claiming it.
-				dbg("intent dropped for " .. device .. " (daemon says " .. state .. ")")
-				wanted[device] = nil
-				dropped = true
+-- Build the device list from a listing plus the kernel's input devices.
+local function buildDevices(tree, inputs)
+	local hideEmpty = noctalia.getConfig("hide_empty_devices")
+	if hideEmpty == nil then
+		hideEmpty = true
+	end
+	local detect = noctalia.getConfig("detect_connected") ~= false
+
+	-- Copies made by input-remapper / ds4kbm carry the real device's name, so
+	-- they are left out: otherwise a controller would look connected for as
+	-- long as its copy exists. A `js` handler marks a gamepad, unless the node
+	-- is a uinput device. With no input list at all, everything counts as
+	-- present rather than hiding devices that are actually plugged in.
+	local exact, trimmed = {}, {}
+	local learned = false
+	for _, rec in ipairs(inputs) do
+		local name, phys, uinput, js = rec[2], rec[3], rec[4], rec[5]
+		if phys ~= "input-remapper" and phys ~= "ds4kbm" then
+			exact[name] = true
+			trimmed[trim(name)] = true
+			if uinput == "0" and js == "1" and knownGamepads[trim(name)] ~= true then
+				knownGamepads[trim(name)] = true
+				learned = true
 			end
 		end
+	end
+	if learned then
+		saveJson("gamepads.json", knownGamepads)
+	end
 
-		if dropped then
-			noctalia.state.set("active", wanted)
+	local devices = {}
+	for _, folder in ipairs(tree) do
+		local name = folder.name
+		-- Exact match first; fall back to a whitespace-insensitive compare so a
+		-- folder that lost the device name's padding still matches. `present`
+		-- is what the kernel says; `connected` is what the list shows, which
+		-- the user can switch off (everything "connected").
+		local present = #inputs == 0 or exact[name] == true or trimmed[trim(name)] == true
+		if #folder.presets > 0 or not hideEmpty then
+			table.insert(devices, {
+				name = name,
+				display = trim(name),
+				presets = folder.presets,
+				connected = present or not detect,
+				present = present,
+				gamepad = knownGamepads[trim(name)] == true,
+			})
 		end
-		if noctalia.json.encode(running) ~= noctalia.json.encode(noctalia.state.get("running")) then
-			noctalia.state.set("running", running)
-		end
+	end
+	table.sort(devices, function(a, b)
+		return string.lower(a.display) < string.lower(b.display)
 	end)
+	return devices
 end
 
 -- A device that just came back gets its preset again. The daemon keeps
 -- reporting RUNNING for an injector whose device vanished, so the transition
--- in /proc is what counts, not the daemon state.
+-- in the kernel's device list is what counts, not the daemon state.
 local function reapplyReconnected(devices, before)
 	local wanted = intents()
 	for _, entry in ipairs(devices) do
@@ -483,61 +364,154 @@ local function reapplyReconnected(devices, before)
 	end
 end
 
-local lastDevicesJson = nil
-local lastDaemonOk = nil
+local requestRefresh -- forward declaration
 
-local function publishDevices()
-	local devices = scanDevices()
+local function applyScan(stdout)
+	local listed = nil -- folder -> presets, when this run listed them
+	local order = {}
+	local inputs, states = {}, {}
+	local sig, daemonOk, kbmPath = nil, false, nil
 
+	for line in string.gmatch(stdout, "[^\n]+") do
+		local rec = split(line)
+		local kind = rec[1]
+		if kind == "input" then
+			table.insert(inputs, rec)
+		elseif kind == "state" then
+			states[rec[2]] = rec[3]
+		elseif kind == "dir" then
+			table.insert(order, rec[2])
+		elseif kind == "preset" and listed ~= nil then
+			local list = listed[rec[2]]
+			if list == nil then
+				list = {}
+				listed[rec[2]] = list
+			end
+			table.insert(list, rec[3])
+		elseif kind == "sig" then
+			sig = rec[2]
+			if rec[3] == "new" then
+				listed = {}
+			end
+		elseif kind == "daemon" then
+			daemonOk = rec[2] == "ok"
+		elseif kind == "ds4kbm" and rec[2] == "on" then
+			kbmPath = rec[3]
+		end
+	end
+
+	-- Preset tree: rebuilt only when scan.sh saw the fingerprint change.
+	if listed ~= nil then
+		local tree = {}
+		for _, name in ipairs(order) do
+			local presets = listed[name] or {}
+			table.sort(presets, function(a, b)
+				return string.lower(a) < string.lower(b)
+			end)
+			table.insert(tree, { name = name, presets = presets })
+		end
+		cachedTree = tree
+		treeSig = sig or ""
+	end
+
+	local devices = buildDevices(cachedTree, inputs)
 	local before = wasPresent
 	wasPresent = {}
 	for _, entry in ipairs(devices) do
 		wasPresent[entry.name] = entry.present
 	end
+
+	-- Daemon. No daemon means nothing can possibly be injecting, so drop any
+	-- remembered state instead of showing a stale "running" badge.
+	if daemonOk ~= lastDaemonOk then
+		lastDaemonOk = daemonOk
+		dbg("daemon -> " .. (daemonOk and "ok" or "down"))
+		noctalia.state.set("daemon", daemonOk and "ok" or "down")
+	end
+	local wanted = intents()
+	local changed = false
+	if not daemonOk and next(wanted) ~= nil then
+		wanted = {}
+		changed = true
+	end
+
+	-- ds4kbm. It releases the controller from input-remapper when it starts,
+	-- so a remembered preset for that device is no longer injecting.
+	if kbmPath == nil or kbmPath == "" then
+		ds4kbm = { state = "off" }
+	else
+		local device, preset = string.match(kbmPath, "([^/]+)/([^/]+)%.json%s*$")
+		ds4kbm = { state = "on", device = device, preset = preset, path = kbmPath }
+		if device ~= nil and wanted[device] ~= nil then
+			wanted[device] = nil
+			changed = true
+		end
+	end
+	publishDs4kbm()
+
+	-- Injection state from the daemon. It keeps saying RUNNING after a device
+	-- is unplugged; only a present device really injects. Its preset stays in
+	-- `active` so it is re-applied when the device comes back.
+	local running = {}
+	for _, entry in ipairs(devices) do
+		local device = entry.name
+		local state = states[device] or "ERR"
+		if (state == "RUNNING" or state == "STARTING") and entry.present then
+			running[device] = wanted[device] or ""
+		elseif daemonOk and wanted[device] ~= nil and entry.present and before[device] == true and not reapplying[device] then
+			-- Plugged in for two refreshes in a row and still not injecting:
+			-- stopped elsewhere (GUI) or failed, so stop claiming it.
+			dbg("intent dropped for " .. device .. " (daemon says " .. state .. ")")
+			wanted[device] = nil
+			changed = true
+		end
+	end
+	if changed then
+		noctalia.state.set("active", wanted)
+	end
+	if noctalia.json.encode(running) ~= noctalia.json.encode(noctalia.state.get("running")) then
+		noctalia.state.set("running", running)
+	end
+
 	reapplyReconnected(devices, before)
-	checkStates(devices, before)
 
 	local encoded = noctalia.json.encode(devices)
 	if encoded ~= lastDevicesJson then
 		lastDevicesJson = encoded
-		local connectedCount = 0
-		for _, d in ipairs(devices) do
-			if d.connected then
-				connectedCount = connectedCount + 1
-			end
-		end
-		dbg("publish devices=" .. tostring(#devices) .. " connected=" .. tostring(connectedCount))
+		dbg("publish devices=" .. tostring(#devices))
 		noctalia.state.set("devices", devices)
 		analyzePresets(devices)
 	end
 end
 
-local function checkDaemon()
-	noctalia.runAsync(controlCmd() .. " --command hello", function(result)
-		local ok = (result ~= nil and result.exitCode == 0)
-
-		if ok ~= lastDaemonOk then
-			lastDaemonOk = ok
-			dbg("daemon -> " .. (ok and "ok" or "down"))
-			noctalia.state.set("daemon", ok and "ok" or "down")
+-- Start a refresh unless one is already running; a request that arrives
+-- meanwhile is remembered and runs right after, so refreshes never pile up.
+requestRefresh = function()
+	if scanning then
+		rescanQueued = true
+		return
+	end
+	scanning = true
+	noctalia.runAsync(scanCmd(), function(result)
+		scanning = false
+		if result ~= nil and result.exitCode == 0 then
+			applyScan(result.stdout or "")
+		else
+			dbg("scan.sh failed exit=" .. tostring(result and result.exitCode))
 		end
-
-		-- No daemon means nothing can possibly be injecting, so drop any
-		-- remembered state instead of showing a stale "running" badge.
-		if not ok then
-			local current = noctalia.state.get("active")
-			if type(current) == "table" and next(current) ~= nil then
-				noctalia.state.set("active", {})
-			end
+		if rescanQueued then
+			rescanQueued = false
+			requestRefresh()
 		end
 	end)
 end
 
+-- Forget the preset listing so the next refresh rebuilds it (Reload, open,
+-- settings change).
 local function refreshAll()
+	treeSig = ""
 	lastDevicesJson = nil
-	publishDevices()
-	checkDaemon()
-	checkDs4kbm()
+	requestRefresh()
 end
 
 local function stopAll()
@@ -556,9 +530,8 @@ local function stopAll()
 		noctalia.runAsync(stopCmd(device))
 	end
 	noctalia.state.set("active", {})
-	noctalia.state.set("scan_request", noctalia.nowMs())
 	noctalia.runAsync(ds4kbmCmd("stop"), function(_result)
-		checkDs4kbm()
+		requestRefresh()
 	end)
 end
 
@@ -593,9 +566,7 @@ noctalia.state.set("active", startupActive)
 noctalia.state.set("running", {})
 noctalia.state.set("modes", loadJson("modes.json"))
 noctalia.state.set("kbm_analysis", analysis)
-publishDevices()
-checkDaemon()
-checkDs4kbm()
+requestRefresh()
 
 -- ---------------------------------------------------------------------------
 -- watches
@@ -634,9 +605,8 @@ function update()
 	end
 	noctalia.setUpdateInterval(seconds * 1000)
 
-	publishDevices()
-	checkDaemon()
-	checkDs4kbm()
+	-- Everything happens in scan.sh and its callback; see "refresh" above.
+	requestRefresh()
 end
 
 function onConfigChanged()
@@ -651,7 +621,7 @@ function onConfigChanged()
 		if ds4kbm.state == "on" and ds4kbm.path ~= nil then
 			dbg("ds4kbm tuning changed, restarting")
 			noctalia.runAsync(ds4kbmCmd("start " .. shq(ds4kbm.path) .. args), function(_result)
-				checkDs4kbm()
+				requestRefresh()
 			end)
 		end
 	end

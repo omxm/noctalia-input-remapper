@@ -15,7 +15,7 @@
 -- With debug_log on it writes <pluginDataDir>/debug.log and prints its
 -- version + VM id in the footer.
 
-local PLUGIN_VERSION = "0.6.0"
+local PLUGIN_VERSION = "0.6.1"
 
 -- ---------------------------------------------------------------------------
 -- instrumentation
